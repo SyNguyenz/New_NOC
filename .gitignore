@@ -1,0 +1,39 @@
+# Environments
+venv/
+.env
+__pycache__/
+*.pyc
+
+# Logs & transient run artifacts
+*.log
+*.err
+err*.txt
+
+# Backup files
+*.bak
+
+# Archives (generated data bundles, never source)
+*.zip
+
+# Numpy binary arrays (generated features/tokens, always regenerable)
+*.npy
+*.npz
+
+# Generated / cached data directories
+cache_insilico/
+cache_real/
+data_cross/
+data_insilico/
+data_insilico_w/
+data_kaggle/
+data_leaky/
+data_lupi/
+data_lupi_smoke/
+data_w_inc26/
+inc22_clean/data_raw/
+results/
+
+# Large generated dataset splits (regenerate via synth/generate_dataset.py)
+data/synth/raw_synth_train.csv
+data/synth/raw_synth_val.csv
+data/meta.json

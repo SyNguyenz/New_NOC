@@ -1,0 +1,21 @@
+{
+  "n_loci": 24,
+  "d_locus": 16,
+  "d_model": 128,
+  "n_heads": 4,
+  "n_isab": 2,
+  "m_inducing": 32,
+  "n_classes": 45,
+  "n_noc": 6,
+  "dropout": 0.1,
+  "lr": 6e-4,
+  "weight_decay": 1e-4,
+  "batch_size": 256,
+  "epochs": 150,
+  "patience": 25,
+  "alpha_reject": 0.5,
+  "beta_card": 0.3,
+  "card_lambda": 0.02,
+  "pos_weight_cls": 5.0,
+  "max_seq": 160
+}
