@@ -530,7 +530,7 @@ jobs = {
                              "--n_slot_iters", "3", "--ot_eps", "0.05", "--ot_iters", "5",
                              "--epochs", "150", "--out_subdir", "inc21_sos_aslot"],
     # ── INCREMENT 22: fixed AdaptiveSlot arms ───────────────────────────────────
-    "inc22_fixed_aslot": S + ["--noc_head_v2", "--nc_attn", "mab0", "--feas_filter", "--soft_attr_label", 
+    "inc22_fixed_aslot": S + ["--log_per_noc", "--noc_head_v2", "--nc_attn", "mab0", "--feas_filter", "--soft_attr_label",
                              "--n_token_feats", "8", "--cls_decoder", "aslot", "--encoder", "isab++",
                              "--aux_heads", "--num_embed", "periodic", "--periodic_sigma", "0.3",
                              "--mask_peaks", "0.15", "--set_of_set",
@@ -582,6 +582,55 @@ jobs = {
                              "--mask_peaks", "0.15", "--set_of_set",
                              "--n_slot_iters", "3", "--ot_eps", "0.05", "--ot_iters", "5",
                              "--epochs", "150", "--out_subdir", "inc26_hybrid_aslot"],
+    # ── INCREMENT 27: LEARNED gate-count (design_4head_decomposition.md sec3.2) — the 4-head COUNT facet.
+    #   Differentiable sum(sigmoid(gate))~=NOC consistency on the AdaSlot gate, gradient to the encoder
+    #   (unlike the DETACHED noc_head_v2). count=sum(gate) becomes LEARNED. Baseline for the A/B = the
+    #   existing inc22_fixed_aslot arm (identical config MINUS --gate_count). Judge on DEV per-NOC oracle +
+    #   the new metrics.json em_gate_sum / gate_count_acc vs post_hoc/noc_v2 (NO-REGRESSION N1-N4), >=3 seeds.
+    #   ABLATION-FIRST (design sec6b): run THIS single-mechanism arm before any stack.
+    "inc27_gatecount_aslot": S + ["--gate_count", "--log_per_noc", "--noc_head_v2", "--nc_attn", "mab0", "--feas_filter", "--soft_attr_label",
+                             "--n_token_feats", "8", "--cls_decoder", "aslot", "--encoder", "isab++",
+                             "--aux_heads", "--num_embed", "periodic", "--periodic_sigma", "0.3",
+                             "--mask_peaks", "0.15", "--set_of_set",
+                             "--n_slot_iters", "3", "--ot_eps", "0.05", "--ot_iters", "5",
+                             "--epochs", "150", "--out_subdir", "inc27_gatecount_aslot"],
+    # inc27 FULL 4-HEAD (design_4head_decomposition.md) — the four facets of ONE decomposition, flag->head:
+    #   head1 present-set (cls) = the aslot decoder base (always on)
+    #   head2 count (gate)      = --gate_count       (sec3.2 learned sum(gate)~=NOC; the new mechanism)
+    #   head3 attr              = --ml_attr (sec3.3 multi-label SIGMOID co-membership head — a shared allele
+    #                             credited to EVERY carrier, unlike softmax) + --soft_attr_label (soft
+    #                             EuroForMix phi*CN target for the softmax attr head; both from/added to base)
+    #   head4 phi + coupling    = --recon (sec3.5 analysis-by-synthesis: predicted attr*phi must re-explain h)
+    #   Per design sec6b (stacking rarely compounds; Kurin/Standley 2022) this is the STACK — run AFTER the
+    #   single-mechanism inc27_gatecount_aslot shows no N1-N4 regression. A full ablation ladder would also
+    #   test --ml_attr alone and --recon alone (reachable by editing RUNS).
+    "inc27_4head_aslot": S + ["--gate_count", "--ml_attr", "--recon", "--log_per_noc", "--noc_head_v2", "--nc_attn", "mab0", "--feas_filter", "--soft_attr_label",
+                             "--n_token_feats", "8", "--cls_decoder", "aslot", "--encoder", "isab++",
+                             "--aux_heads", "--num_embed", "periodic", "--periodic_sigma", "0.3",
+                             "--mask_peaks", "0.15", "--set_of_set",
+                             "--n_slot_iters", "3", "--ot_eps", "0.05", "--ot_iters", "5",
+                             "--epochs", "150", "--out_subdir", "inc27_4head_aslot"],
+    # ── INCREMENT 28: the MISSING sec3.2/sec3.4 design pieces (completes the count facet + phi head).
+    #   Built on inc27_gatecount (gate_count). ABLATION-FIRST (sec6b): inc28_massgate = +the single #1
+    #   piece; inc28_gatefull = + all three (mass-aware gate + gumbel-temp anneal + presence-gated phi).
+    #   All carry --log_per_noc so ONE fresh run of either also yields per-NOC convergence curves (tests
+    #   whether N5 converges/peaks later than N1-N4 — no need to re-run inc22/inc27). JUDGE: DEV per-NOC
+    #   oracle + em_gate_sum/gate_count_acc vs post_hoc/noc_v2, NO-REGRESSION N1-N4, >=3 seeds.
+    #   sec3.2.1 mass-aware gate: does "slot=contributor iff explains real mass" push gate-count past RF?
+    "inc28_massgate_aslot": S + ["--gate_count", "--gate_mass", "--log_per_noc", "--noc_head_v2", "--nc_attn", "mab0", "--feas_filter", "--soft_attr_label",
+                             "--n_token_feats", "8", "--cls_decoder", "aslot", "--encoder", "isab++",
+                             "--aux_heads", "--num_embed", "periodic", "--periodic_sigma", "0.3",
+                             "--mask_peaks", "0.15", "--set_of_set",
+                             "--n_slot_iters", "3", "--ot_eps", "0.05", "--ot_iters", "5",
+                             "--epochs", "150", "--out_subdir", "inc28_massgate_aslot"],
+    # full sec3.2+sec3.4 completion: mass-aware gate + anneal gumbel_temp 1.0->0.3 + presence-gated phi (β-NLL,
+    # fixed-weight NOT Kendall). Run as a SEPARATE ablation after inc28_massgate (sec6b: stacking rarely compounds).
+    "inc28_gatefull_aslot": S + ["--gate_count", "--gate_mass", "--gate_temp_final", "0.3", "--phi_gated", "--log_per_noc", "--noc_head_v2", "--nc_attn", "mab0", "--feas_filter", "--soft_attr_label",
+                             "--n_token_feats", "8", "--cls_decoder", "aslot", "--encoder", "isab++",
+                             "--aux_heads", "--num_embed", "periodic", "--periodic_sigma", "0.3",
+                             "--mask_peaks", "0.15", "--set_of_set",
+                             "--n_slot_iters", "3", "--ot_eps", "0.05", "--ot_iters", "5",
+                             "--epochs", "150", "--out_subdir", "inc28_gatefull_aslot"],
 }
 sub_of = {"inc17_base": "inc17_base", "inc17_ns": "inc17_ns", "inc17_ns_distill": "inc17_ns_distill",
           "inc16_addrecon": "inc16_addrecon",
@@ -662,6 +711,10 @@ sub_of = {"inc17_base": "inc17_base", "inc17_ns": "inc17_ns", "inc17_ns_distill"
           "inc24_noisegate_aslot":    "inc24_noisegate_aslot",
           "inc25_replicates_aslot":    "inc25_replicates_aslot",
           "inc26_hybrid_aslot":    "inc26_hybrid_aslot",
+          "inc27_gatecount_aslot":    "inc27_gatecount_aslot",
+          "inc27_4head_aslot":    "inc27_4head_aslot",
+          "inc28_massgate_aslot":    "inc28_massgate_aslot",
+          "inc28_gatefull_aslot":    "inc28_gatefull_aslot",
           }
 
 # ── Kaggle-machine split (seed 42 first; add seeds later only for arms that look promising) ──
@@ -718,9 +771,22 @@ MACHINES = {
     #   Run:  MACHINE=M1 python kaggle_run_increment1.py  (M2, M3 likewise in parallel)
     #   Judge: DEV N5 oracle vs mab0 .639 + guard N1-4; real-test N5 oracle vs .747.
     #   Small-scale screen (reachable via RUNS=): sm_base | sm_sos | sm_aslot | sm_spen
-    "M1": "inc21_base,inc21_spen",
-    "M2": "inc21_sos,inc21_sos_softattr",
-    "M3": "inc21_aslot,inc21_sos_aslot",
+    # CURRENT INCREMENT = 27 (LEARNED gate-count, design_4head_decomposition.md sec3.2). A/B on Kaggle:
+    #   M1 = inc22_fixed_aslot (BASELINE) + inc27_gatecount_aslot (+--gate_count) on ONE machine = clean
+    #        same-hardware A/B; M2 = inc27_4head_aslot (FULL 4-head = gate_count + ml_attr + recon +
+    #        soft_attr_label; a SEPARATE stack ablation).
+    #   Run:  MACHINE=M1 SEEDS=42 python kaggle_run_increment1.py   (M2 on a 2nd machine, in PARALLEL)
+    #   Promote to 3 seeds only if seed-42 looks promising:  SEEDS=42,43,44 MACHINE=M1 ...
+    #   JUDGE (design sec6b guard): DEV per-NOC oracle + metrics.json em_gate_sum/gate_count_acc vs
+    #   post_hoc/noc_v2; NO-REGRESSION N1-N4 vs inc22_fixed_aslot on the SAME in-silico dev.
+    # INCREMENT 28 (missing sec3.2/sec3.4 pieces) — reachable via RUNS or these machine groups:
+    #   M4 = inc28_massgate_aslot (mass-aware gate alone) · M5 = inc28_gatefull_aslot (all 3 pieces).
+    #   Each is a fresh run with --log_per_noc → also yields per-NOC convergence curves in one go.
+    "M1": "inc22_fixed_aslot,inc27_gatecount_aslot",
+    "M2": "inc27_4head_aslot",
+    "M3": "inc21_aslot,inc21_sos_aslot",   # prior inc21 group (reachable via RUNS= too)
+    "M4": "inc28_massgate_aslot",
+    "M5": "inc28_gatefull_aslot",
     # (Inc20 full-scale, reachable via RUNS=): inc20_sos | inc20_sos_softattr | inc20_sos_feas
     # (Inc19 decoder-level control, reachable via RUNS=): inc19_sos | inc19_sos_softattr
     # INCREMENT 18 (reachable via RUNS=): inc18_soft_attr

@@ -129,6 +129,14 @@ def add_dropin(mix, rng):
 # degradation give the real heteroscedastic faint distribution. No SS pool needed (simpler+faster than overlay).
 PH_CV = float(os.environ.get("STR_PH_CV", "0.60"))        # peak-height coeff of variation (gamma heteroscedasticity)
 DEG_BETA_MAX = float(os.environ.get("STR_DEG", "0.0040")) # degradation slope/bp: deg=exp(-beta*(size-100)), beta~U(0,max) per mixture
+# ── Cross-locus signal (OPT-IN, default OFF → bit-identical) ────────────────────────────────────────
+# Draw degradation β PER CONTRIBUTOR instead of per-mixture: each donor's peaks decay across
+# fragment-size/loci at their OWN rate → a discriminative cross-locus fingerprint (differential
+# degradation; EuroForMix/STRmix model per-contributor deg). Makes implied-φ consistency DISCRIMINATIVE
+# beyond the exhausted shared-φ (true donor = one consistent β_c; decoy = mixed β's). β_c~U(0,MAX);
+# MAX=0.008 calibrated to real per-donor slope-std 0.00233 (scratchpad/test_crosslocus_gen.py).
+PERCONTRIB_DEG = int(os.environ.get("STR_PERCONTRIB_DEG", "0"))
+PERCONTRIB_DEG_MAX = float(os.environ.get("STR_PERCONTRIB_DEG_MAX", "0.008"))
 # CALIBRATED to real test N5 (measure_gen_fidelity.py): median 137~132, p90~1000, occ 5.7~5.74, decoy structure matched.
 PEAK_TMU = np.log(float(os.environ.get("STR_PEAK_T", "750.0"))); PEAK_TSIG = float(os.environ.get("STR_PEAK_TSIG", "1.10"))  # per-mixture template scale (lognormal)
 
@@ -272,13 +280,17 @@ def gen_mixture_peak(donor_cols, rng, bin_size, mode="realistic"):
     """EuroForMix-style direct peak generation (no overlay). Same return signature as gen_mixture."""
     k = len(donor_cols); phi = _proportions(k, rng, mode)
     T = float(np.exp(rng.normal(PEAK_TMU, PEAK_TSIG)))
-    beta = rng.uniform(0, DEG_BETA_MAX)
     size = bin_size if bin_size is not None else np.zeros(N_FLAT, np.float64)
-    deg = np.exp(-beta * np.maximum(size - 100.0, 0.0))    # fragment-size degradation
+    sfac = np.maximum(size - 100.0, 0.0)                    # fragment-size degradation substrate
+    if PERCONTRIB_DEG:                                      # opt-in: per-contributor β_c (cross-locus fingerprint)
+        betas = rng.uniform(0, PERCONTRIB_DEG_MAX, size=k)
+    else:                                                  # default: per-mixture shared β (bit-identical path)
+        beta = rng.uniform(0, DEG_BETA_MAX); deg = np.exp(-beta * sfac)
     shape = 1.0 / PH_CV**2
     contrib = np.zeros((k, N_FLAT), dtype=np.float64)
     for di, (c, p) in enumerate(zip(donor_cols, phi)):
-        mu = T * p * DONOR_DOSAGE[c] * deg * EFF_BIN        # expected height per bin (0 where donor has no allele); EFF_BIN = per-locus efficiency
+        deg_c = np.exp(-betas[di] * sfac) if PERCONTRIB_DEG else deg   # per-contributor vs shared degradation
+        mu = T * p * DONOR_DOSAGE[c] * deg_c * EFF_BIN      # expected height per bin (0 where donor has no allele); EFF_BIN = per-locus efficiency
         nz = np.where(mu > 0)[0]
         if len(nz): contrib[di, nz] = rng.gamma(shape, mu[nz] * PH_CV**2)   # Gamma(mean=mu, CV=PH_CV)
     mix = contrib.sum(0)

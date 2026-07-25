@@ -878,6 +878,7 @@ class AdaptiveSlotDecoder(nn.Module):
         ot_iters: int = 5,          # Sinkhorn normalization steps per iter
         gumbel_temp: float = 1.0,   # AdaSlot concrete-Bernoulli temperature
         dropout: float = 0.1,
+        gate_mass: bool = False,    # §3.2.1: feed grad-enabled slot-mass into the existence gate
     ):
         super().__init__()
         self.n_iters = n_iters
@@ -918,6 +919,15 @@ class AdaptiveSlotDecoder(nn.Module):
         # AsymmetricLoss under --loss asl — the objective here is ASL(γ_neg=4), not plain BCE.
         self.gate_head = nn.Linear(d_model, 1)                              # AdaSlot slot-existence
         self.cls_head  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))  # content
+
+        # §3.2.1 MASS-AWARE gate (gate_mass; default off → no-op): feed a grad-enabled per-slot mass into
+        # the existence gate so "a slot is a real contributor iff it explains real peak mass" (the SUM
+        # counting provably needs — DeepSets/GIN). ZERO-INIT (ReZero, Bachlechner 2020) → exact no-op at
+        # start (bit-identical warm-start), trains in only if the mass signal helps the gate/count.
+        self.use_gate_mass = bool(gate_mass)
+        if self.use_gate_mass:
+            self.mass_gate = nn.Linear(1, 1)
+            nn.init.zeros_(self.mass_gate.weight); nn.init.zeros_(self.mass_gate.bias)
 
         # ── NOC head from gate profile ──────────────────────────────────────
         # Takes the K-dim gate vector (soft NOC indicator) → n_noc logits.
@@ -996,6 +1006,18 @@ class AdaptiveSlotDecoder(nn.Module):
 
         # ── 4. AdaSlot (CVPR2024): separate gate_head, concrete Bernoulli ──────
         gate_logit = self.gate_head(slots).squeeze(-1)                 # (B, K) slot existence
+        if self.use_gate_mass:
+            # §3.2.1: recompute the per-slot mass WITH gradient (the block above is detached for the count
+            # head) and add a ReZero-gated log1p-mass term → the gate sees "does this slot explain real
+            # peak mass?". Zero-init mass_gate → no-op at start; gradient flows gate→slots→MESH→encoder.
+            aff_g = (self.q_proj(self.slot_norm1(slots)) @ K_h.transpose(1, 2)) / self.scale  # (B,K,N)
+            aff_g = aff_g.masked_fill(pad_mask.unsqueeze(1), -1e9)
+            p2s_g = torch.softmax(aff_g, dim=1)
+            pw_g = (~pad_mask).unsqueeze(1).to(p2s_g.dtype)
+            if peak_w is not None:
+                pw_g = pw_g * peak_w.unsqueeze(1).to(p2s_g.dtype)
+            mass_g = (p2s_g * pw_g).sum(-1)                             # (B, K) grad-enabled slot mass
+            gate_logit = gate_logit + self.mass_gate(torch.log1p(mass_g).unsqueeze(-1)).squeeze(-1)
         if self.training:
             # Binary-Concrete / Gumbel-Sigmoid (Maddison et al., ICLR 2017): the additive noise must be
             # LOGISTIC, L = log(u) - log(1-u) (= the difference of two Gumbels), which is zero-mean and
@@ -1224,6 +1246,8 @@ class SetTransformerMixture(nn.Module):
         ot_eps: float = 0.05,          # Sinkhorn ε (lower = sharper OT assignment)
         ot_iters: int = 5,             # Sinkhorn normalization steps per iter
         gumbel_temp: float = 1.0,      # AdaSlot concrete-Bernoulli temperature
+        gate_mass: bool = False,       # §3.2.1: feed grad-enabled slot-mass into the AdaSlot existence gate (off = no-op)
+        phi_gated: bool = False,       # §3.4: presence-gated phi + β-NLL (adds phi_logvar_head; loss masked to present donors)
         noc_head_v2: bool = False,     # paper-proof CORN count head (slot-mass + MAC + prob-profile); off = no-op
         lupi_phys: bool = False,       # Inc-LUPI: privileged PHYSICAL heads (degradation β; clean mu+var Gaussian β-NLL; drop-in) — F10 transfer lever
         em_phi_feature: bool = False,  # internalize the INDEPENDENT EM mixture-proportion (Mx) deconvolution:
@@ -1354,7 +1378,7 @@ class SetTransformerMixture(nn.Module):
             self.cls_decoder_module = AdaptiveSlotDecoder(
                 d_model, n_classes=n_classes, n_noc=5,
                 n_iters=n_slot_iters, ot_eps=ot_eps, ot_iters=ot_iters,
-                gumbel_temp=gumbel_temp, dropout=dropout,
+                gumbel_temp=gumbel_temp, dropout=dropout, gate_mass=gate_mass,
             )
             # Register donor_geno buffers + geno_proj if not already done by geno_query branch.
             # _encode_geno() uses these for the CoSA slot initialization.
@@ -1461,6 +1485,13 @@ class SetTransformerMixture(nn.Module):
         if aux_heads:
             self.attr_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes + 1))
             self.phi_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes))
+        # §3.4 presence-gated phi + β-NLL (phi_gated; needs aux_heads). Adds a per-donor log-variance head so
+        # phi is trained with a heteroscedastic β-NLL (Seitzer 2022) on the PRESENT donors only (loss masked
+        # by y>0) — fixes the L1-on-88%-zero collapse (which drove phi→0 everywhere). Off → phi_head path
+        # unchanged (bit-identical).
+        self.phi_gated = bool(phi_gated) and bool(aux_heads)
+        if self.phi_gated:
+            self.phi_logvar_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes))
         # Inc-LUPI privileged PHYSICAL heads (train-only; discarded at inference like aux_heads).
         self.lupi_phys = lupi_phys
         if lupi_phys:
@@ -1970,6 +2001,13 @@ class SetTransformerMixture(nn.Module):
             "logits_cls":  logits_cls,                           # (B, K)  (incl. ref_match / em_phi if on)
             "logit_reject": self.reject_head(z_rej),             # (B, 1)
             "logits_card": slot_out["logits_card"],              # (B, 5)  slot-gate count (unchanged)
+            # §3.2 learned gate-count: surface the AdaSlot existence gate so the trainer can add the
+            # differentiable Σgate≈NOC consistency loss (gradient → gate_head → slots → MESH → encoder)
+            # and decode k=round(Σgate). BIT-IDENTICAL: these tensors already exist; adding dict keys
+            # changes no computation and they are read only when --gate_count is on.
+            "gate":        slot_out["gate"],                     # (B,K) concrete sample (train) / sigmoid (eval)
+            "gate_logit":  slot_out["gate_logit"],               # (B,K) pre-noise existence logit
+            "slot_mass":   slot_out["slot_mass"],                # (B,K) mass-preserving count signal (detached)
         }
         if self.noc_head_v2:                                     # paper-proof CORN count head → (B, 4)
             # feed the ref-matched/em-phi logits so the count head reads the SAME ranking as the oracle/decode
@@ -1979,6 +2017,8 @@ class SetTransformerMixture(nn.Module):
             out["logits_attr"] = attr_raw                        # (B, N, K+1)
             out["phi"] = torch.nn.functional.softplus(
                 self.phi_head(z))                                 # (B, K)
+            if self.phi_gated:                                   # §3.4: per-donor log-variance for β-NLL
+                out["phi_logvar"] = self.phi_logvar_head(z)      # (B, K)
         if self.lupi_phys:                                       # Inc-LUPI physical privileged outputs
             out["degr"]         = self.degr_head(z).squeeze(-1)  # (B,)   scaled degradation β
             _mv = self.muvar_head(H)                             # (B, N, 2)

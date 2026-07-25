@@ -928,6 +928,8 @@ def train(cfg: dict):
         ot_eps       = float(cfg.get("ot_eps", 0.05)),
         ot_iters     = int(cfg.get("ot_iters", 5)),
         gumbel_temp  = float(cfg.get("gumbel_temp", 1.0)),
+        gate_mass    = bool(cfg.get("gate_mass", False)),     # §3.2.1 mass-aware AdaSlot gate
+        phi_gated    = bool(cfg.get("phi_gated", False)),     # §3.4 presence-gated phi + β-NLL
         noc_head_v2  = bool(cfg.get("noc_head_v2", False)),   # paper-proof CORN count head (mass+MAC+prob)
         em_phi_feature = bool(cfg.get("em_phi_feature", False)),  # internalize EM Mx deconvolution (LOP cls + Hill noc)
         noise_gate = bool(cfg.get("noise_gate", False)),          # SOFT supervised per-peak stutter/drop-in reliability gate
@@ -995,6 +997,43 @@ def train(cfg: dict):
     noc_v2_w   = float(cfg.get("noc_v2_weight", beta))   # weight of its CORN-on-true-NOC loss
     if use_noc_v2:
         print(f"noc_head_v2 ON: CORN ordinal count on TRUE noc (w={noc_v2_w}); test decode compares vs joint/post-hoc")
+    # §3.2 LEARNED gate-count (design_4head_decomposition.md): calibrate the AdaSlot existence gate directly
+    # to the true NOC so count = Σgate is *learned* WITH gradient to the encoder — the priority fix vs the
+    # DETACHED post-hoc noc_head_v2/RF crutch. aslot-only (needs the gate). Default off → path unchanged.
+    use_gate_count = bool(cfg.get("gate_count", False)) and cfg.get("cls_decoder") == "aslot"
+    gate_count_w   = float(cfg.get("gate_count_weight", beta))   # Σgate≈NOC smooth-L1 weight
+    if cfg.get("gate_count", False) and not use_gate_count:
+        print("[WARN] --gate_count needs --cls_decoder aslot (the AdaSlot gate) -> ignored")
+    if use_gate_count:
+        print(f"gate_count ON (design 4-head sec3.2): differentiable sum(gate)~=NOC consistency "
+              f"(smooth-L1 w={gate_count_w}); count=sum(gate) LEARNED (gradient->encoder); "
+              f"decode adds gate_sum vs joint/post-hoc/noc_v2")
+    # Per-NOC val-oracle TRAJECTORY logging (--log_per_noc): writes hrow['val_per_noc_oracle'] each epoch
+    # so per-NOC convergence SPEED is inspectable (does N5 converge slower / peak LATER than N1-N4, and do
+    # extra heads widen that gap?). Diagnostic only: one extra val pass; selection metric untouched.
+    # Default off -> history schema + per-epoch timing unchanged (bit-identical training).
+    use_log_per_noc = bool(cfg.get("log_per_noc", False))
+    if use_log_per_noc:
+        print("log_per_noc ON: per-NOC val oracle appended to history each epoch (per-NOC convergence trajectory)")
+    # §3.2.1 mass-aware gate (built into the model via gate_mass); §3.2.4 anneal gumbel_temp; §3.4 phi_gated.
+    use_gate_mass = bool(cfg.get("gate_mass", False)) and cfg.get("cls_decoder") == "aslot"
+    if use_gate_mass:
+        print("gate_mass ON (sec3.2.1): grad-enabled slot-mass fed into the AdaSlot existence gate (ReZero, no-op start)")
+    # §3.2.4 anneal the Gumbel temperature from gumbel_temp -> gate_temp_final over training (sharper gate
+    # for counting late; Concrete/Gumbel-Softmax). Off (None) -> temp fixed at gumbel_temp (bit-identical).
+    gate_temp_init  = float(cfg.get("gumbel_temp", 1.0))
+    gate_temp_final = cfg.get("gate_temp_final", None)
+    use_temp_anneal = (gate_temp_final is not None) and cfg.get("cls_decoder") == "aslot"
+    if use_temp_anneal:
+        gate_temp_final = float(gate_temp_final)
+        print(f"gate_temp anneal ON (sec3.2.4): gumbel_temp {gate_temp_init} -> {gate_temp_final} linearly over training")
+    # §3.4 presence-gated phi + β-NLL: replace L1-on-sparse with a heteroscedastic β-NLL masked to present
+    # donors (needs aux_heads + the phi_logvar_head built when phi_gated). Off -> L1 phi path unchanged.
+    use_phi_gated = bool(cfg.get("phi_gated", False)) and getattr(model, "phi_gated", False)
+    phi_gated_w   = float(cfg.get("phi_gated_weight", 0.3))   # FIXED weight (NOT Kendall — β-NLL can go negative)
+    if use_phi_gated:
+        print(f"phi_gated ON (sec3.4): presence-gated phi + beta-NLL (masked to present donors, fixed w={phi_gated_w}, "
+              f"NOT Kendall since beta-NLL can be negative) replaces L1-on-sparse")
     card_lam = cfg.get("card_lambda", 0.02)     # cardinality cost weight
     # Cardinality class weights (train ~85% NOC=1 -> plain CE collapses to k=1)
     _nc = np.bincount(np.clip(np.load(DATA_DIR/"noc_train.npy"),1,5)-1, minlength=5).astype(float)
@@ -1291,8 +1330,12 @@ def train(cfg: dict):
     for epoch in range(1, epochs + 1):
         model.train()
         if _ldam is not None: _ldam.set_epoch(epoch)     # Inc9 A1: deferred re-weighting schedule
+        if use_temp_anneal:                              # §3.2.4: linearly sharpen the AdaSlot gate over training
+            frac = (epoch - 1) / max(1, epochs - 1)
+            model.cls_decoder_module.gumbel_temp = gate_temp_init + (gate_temp_final - gate_temp_init) * frac
         epoch_loss = epoch_cls = epoch_rej = epoch_noc_l = 0.0
         epoch_attr = epoch_phi = epoch_rnc = epoch_irm = 0.0
+        epoch_gate_count = 0.0                            # §3.2 Σgate≈NOC consistency
 
         for _batch in train_loader:
             tokens, mask, y, noc, attr, phi = _batch[:6]
@@ -1384,6 +1427,18 @@ def train(cfg: dict):
             if use_noc_v2 and "logits_count_v2" in out:
                 loss = loss + noc_v2_w * corn_loss(out["logits_count_v2"], noc.clamp(1, 5), 5)
 
+            # §3.2 LEARNED gate-count (--gate_count): calibrate the AdaSlot existence gate directly to the
+            # true NOC so count = Σgate is a *learned* quantity. Unlike noc_head_v2 (reads DETACHED features
+            # → a post-hoc reader capped by ID quality), this consistency loss keeps gradient through
+            # gate_logit → slots → MESH → encoder, so H learns count-relevant peak-mass features
+            # (AdaSlot CVPR2024; design §3.2.2/§3.2.5). Robust smooth-L1 on the sum of gate PROBABILITIES
+            # (noise-free sigmoid — the "sum of gate probabilities = true count" regularizer) vs the true NOC.
+            if use_gate_count and "gate_logit" in out:
+                gate_sum = torch.sigmoid(out["gate_logit"]).sum(-1)           # (B,) Σ P(slot active)
+                loss_gate_count = F.smooth_l1_loss(gate_sum, noc.clamp(1, 5).float())
+                loss = loss + gate_count_w * loss_gate_count
+                epoch_gate_count += loss_gate_count.item()
+
             # SOFT per-peak noise/stutter gate (noise_gate): supervised by the PROVEN real/noise label —
             # peak's (locus,allele) carried by >=1 TRUE contributor (Balding-Buckleton drop-in distinction).
             # The gate gets its OWN calibrated P(real) target so it can't co-adapt through the cls loss.
@@ -1444,9 +1499,25 @@ def train(cfg: dict):
                     else:
                         loss_attr = F.cross_entropy(la.reshape(B_ * S_, C_), attr.reshape(B_ * S_),
                                                     ignore_index=-1)
-                    loss_phi  = F.l1_loss(out["phi"], phi)
-                    loss = loss + (torch.exp(-log_var_attr) * loss_attr + log_var_attr
-                                   + torch.exp(-log_var_phi) * loss_phi + log_var_phi)
+                    if use_phi_gated and "phi_logvar" in out and (y > 0.5).any():
+                        # §3.4 presence-gated β-NLL (Seitzer 2022): supervise phi ONLY on PRESENT donors
+                        # (y>0.5) so the ~88%-zero absent slots can't collapse it to 0; heteroscedastic with
+                        # a stop-grad β=0.5 weight (avoids the variance-collapse pitfall).
+                        pres = (y > 0.5)
+                        lv = out["phi_logvar"].clamp(-8.0, 8.0)
+                        nll = 0.5 * torch.exp(-lv) * (out["phi"] - phi) ** 2 + 0.5 * lv
+                        w_b = torch.exp(lv).detach().clamp(min=1e-6) ** 0.5
+                        loss_phi = (nll * w_b)[pres].mean()
+                    else:
+                        loss_phi  = F.l1_loss(out["phi"], phi)
+                    # attr (CE, bounded >=0) stays Kendall-weighted. The §3.4 β-NLL phi can go NEGATIVE →
+                    # a Kendall wrapper would detonate (exp(−log_var)·(neg loss)→−∞ = the §4/§6b pitfall), so
+                    # phi_gated uses a FIXED weight; the legacy L1 phi (>=0) keeps its Kendall wrapper.
+                    loss = loss + torch.exp(-log_var_attr) * loss_attr + log_var_attr
+                    if use_phi_gated and "phi_logvar" in out:
+                        loss = loss + phi_gated_w * loss_phi
+                    else:
+                        loss = loss + torch.exp(-log_var_phi) * loss_phi + log_var_phi
                     loss_attr_v = loss_attr.item(); loss_phi_v = loss_phi.item()
 
             # Inc-LUPI: privileged PHYSICAL supervision (synthetic rows only; β=-1 sentinel masks real N1).
@@ -1775,6 +1846,9 @@ def train(cfg: dict):
                                        else float(torch.exp(-log_var_rnc).item()), 4)
         if use_irm:
             hrow["irm_loss"] = round(epoch_irm / n, 6)
+        if use_log_per_noc:   # per-NOC val oracle trajectory (tests the per-NOC convergence-speed hypothesis)
+            _pn = evaluate_per_noc_oracle(model, sel_loader, phi_inject_fn=None)
+            hrow["val_per_noc_oracle"] = {str(k): round(v, 4) for k, v in _pn.items()}
         history.append(hrow)
 
         # ── EARLY-ABORT check (every 10 ep; only when enabled) ────────────────────────────────
@@ -1808,6 +1882,7 @@ def train(cfg: dict):
                 _w = float(rnc_fixed_w) if rnc_fixed_w is not None else float(torch.exp(-log_var_rnc).item())
                 aux_str += f" rnc={epoch_rnc/n:.3f}(w={_w:.2f})"
             aux_str += (f" irm={epoch_irm/n:.4f}") if use_irm else ""
+            aux_str += (f" gcount={epoch_gate_count/n:.3f}") if use_gate_count else ""
             print(
                 f"  Ep {epoch:3d} | loss={epoch_loss:.4f} "
                 f"(cls={epoch_cls/n:.3f} rej={epoch_rej/n:.3f} noc={epoch_noc_l/n:.3f}{aux_str}) "
@@ -1829,7 +1904,7 @@ def train(cfg: dict):
     model.load_state_dict(torch.load(results_dir / "best_model.pt", weights_only=True))
     model.eval()
     probs_list, card_list, yt_list, noc_list, phi_list, attr_list = [], [], [], [], [], []
-    noc_proj_list = []; ord_list = []; v2_list = []; logit_list = []
+    noc_proj_list = []; ord_list = []; v2_list = []; logit_list = []; gate_list = []
     with torch.no_grad():
         for tokens, mask, y, noc, *_ in test_loader:
             out = model(tokens.to(DEVICE), mask.to(DEVICE))
@@ -1847,6 +1922,8 @@ def train(cfg: dict):
                 ord_list.append(out["logits_card_ord"].cpu().numpy())
             if "logits_count_v2" in out:                      # paper-proof CORN count head (B,4)
                 v2_list.append(out["logits_count_v2"].cpu().numpy())
+            if use_gate_count and "gate_logit" in out:        # §3.2 learned gate-count: Σ P(slot active)
+                gate_list.append(torch.sigmoid(out["gate_logit"]).sum(-1).cpu().numpy())
     P_te = np.concatenate(probs_list); card_te = np.concatenate(card_list)
     y_te_true = np.concatenate(yt_list); noc_te = np.concatenate(noc_list)
     L_te = np.concatenate(logit_list)                                   # raw test logits (phi-rerank)
@@ -1902,6 +1979,13 @@ def train(cfg: dict):
         v2_p = corn_probs(torch.from_numpy(np.concatenate(v2_list)), 5).numpy()   # (N,5) P(NOC=k)
         k_v2 = v2_p.argmax(1) + 1
         em_v2 = per_noc_em(y_te_true, topk_decode(rank_te, k_v2), noc_te)
+    # §3.2 learned gate-count decode: k = round(Σ P(slot active)), clamped to [1,5]. Uses the SAME rank_te
+    # as every other decoder (differs ONLY in the count k), so this isolates the gate-count quality.
+    em_gs = None; k_gs = None
+    if gate_list:
+        gate_sum_te = np.concatenate(gate_list)
+        k_gs = np.clip(np.rint(gate_sum_te), 1, 5).astype(int)
+        em_gs = per_noc_em(y_te_true, topk_decode(rank_te, k_gs), noc_te)
     # DEPLOYABLE decoder is PRE-DECLARED post_hoc (the C4/C5-validated robust count) — NOT whichever scores
     # best on TEST. The old `max(decoders, key=test_em)` was selection-on-test / HARKing: optimistically biased
     # (Cawley & Talbot, JMLR 2010) and against the project's own C6/C7 rule (select on in-silico DEV, eval test
@@ -1910,6 +1994,8 @@ def train(cfg: dict):
     decoders = [("joint_card", em_card, k_card), ("post_hoc", em_post, k_post)]
     if em_v2 is not None:
         decoders.append(("noc_v2", em_v2, k_v2))
+    if em_gs is not None:
+        decoders.append(("gate_sum", em_gs, k_gs))
     _diag = max(decoders, key=lambda c: c[1][0])
     if _diag[0] != "post_hoc":
         print(f"  [diagnostic only] {_diag[0]} scores higher on TEST (EM {_diag[1][0]:.4f} vs post_hoc "
@@ -1922,6 +2008,7 @@ def train(cfg: dict):
     print(f"  {'decode':<14}{'overall':>8}{'NOC1':>7}{'NOC2':>7}{'NOC3':>7}{'NOC4':>7}{'NOC5':>7}")
     _rows = [("oracle", oracle), ("joint-card", em_card), ("post-hoc", em_post)]
     if em_v2 is not None: _rows.append(("noc_v2", em_v2))
+    if em_gs is not None: _rows.append(("gate_sum", em_gs))
     for nm, r in _rows:
         print(f"  {nm:<14}" + "".join(f"{x:>7.3f}" for x in r))
     oracle_em = oracle[0]; card_noc_acc = float((np.clip(k_use, 1, 5) == noc_te).mean())
@@ -1977,6 +2064,8 @@ def train(cfg: dict):
         "em_joint_card":     round(float(em_card[0]), 4),
         "em_post_hoc":       round(float(em_post[0]), 4),
         "em_noc_v2":         (round(float(em_v2[0]), 4) if em_v2 is not None else None),
+        "em_gate_sum":       (round(float(em_gs[0]), 4) if em_gs is not None else None),
+        "gate_count_acc":    (round(float((np.clip(k_gs, 1, 5) == noc_te).mean()), 4) if k_gs is not None else None),
         "oracle_em":         round(float(oracle_em), 4),
         "card_noc_acc":      round(card_noc_acc, 4),
         "reject_auroc":      float(auroc) if auroc is not None else None,
@@ -1985,6 +2074,7 @@ def train(cfg: dict):
         "per_noc_joint_card": _per_noc_dict(em_card),
         "per_noc_post_hoc":  _per_noc_dict(em_post),
         "per_noc_noc_v2":    (_per_noc_dict(em_v2) if em_v2 is not None else None),
+        "per_noc_gate_sum":  (_per_noc_dict(em_gs) if em_gs is not None else None),
         "history":           history,
         "test":              {k: v for k, v in te_metrics.items() if k != "per_noc"},
         "early_abort":       abort_info,   # None unless a fail-fast rule fired
@@ -2241,6 +2331,26 @@ if __name__ == "__main__":
                              "mass-preserving slot-mass + MAC physical features + prob-profile (default off).")
     parser.add_argument("--noc_v2_weight", type=float, default=None,
                         help="noc_head_v2 CORN-on-true-NOC loss weight (default = beta_card)")
+    parser.add_argument("--gate_count", action="store_true",
+                        help="sec3.2 LEARNED gate-count: differentiable sum(gate)~=NOC consistency on the AdaSlot "
+                             "existence gate (gradient to encoder, unlike the DETACHED noc_head_v2). count=sum(gate) "
+                             "becomes learned, not post-hoc; decode compares vs joint/post-hoc/noc_v2. aslot only.")
+    parser.add_argument("--gate_count_weight", type=float, default=None,
+                        help="gate_count sum(gate)~=NOC smooth-L1 loss weight (default = beta = NOC loss weight)")
+    parser.add_argument("--log_per_noc", action="store_true",
+                        help="log per-NOC val oracle EM to history each epoch (val_per_noc_oracle) — inspect "
+                             "per-NOC convergence speed (does N5 peak later than N1-N4?). Diagnostic; default off.")
+    parser.add_argument("--gate_mass", action="store_true",
+                        help="sec3.2.1 mass-aware gate: feed grad-enabled slot-mass into the AdaSlot existence "
+                             "gate (ReZero zero-init, no-op start). aslot only; pairs with --gate_count.")
+    parser.add_argument("--gate_temp_final", type=float, default=None,
+                        help="sec3.2.4: anneal gumbel_temp linearly from --gumbel_temp to this value over training "
+                             "(sharper gate for counting late). Default None = fixed temp.")
+    parser.add_argument("--phi_gated", action="store_true",
+                        help="sec3.4 presence-gated phi + beta-NLL: supervise phi only on present donors with a "
+                             "heteroscedastic loss (adds phi_logvar_head). Fixes L1-on-sparse collapse. Needs --aux_heads.")
+    parser.add_argument("--phi_gated_weight", type=float, default=None,
+                        help="sec3.4 fixed weight for the beta-NLL phi loss (default 0.3; NOT Kendall since beta-NLL can be negative)")
     # ── EBM-SPEN Joint (--cls_decoder spen) ────────────────────────────────────────────────
     parser.add_argument("--n_inf_steps", type=int, default=None,
                         help="spen: projected GD steps at inference (default 10)")
@@ -2294,7 +2404,7 @@ if __name__ == "__main__":
               "add_invar_weight", "add_invar_ramp", "id_dim",
               "recon_weight", "recon_ramp", "add_recon_weight",
               "noise_spectrum_levels", "xnoise_weight", "xnoise_ramp", "xnoise_clean", "warm_start",
-              "n_slot_iters", "ot_eps", "ot_iters", "gumbel_temp", "noc_v2_weight",   # aslot
+              "n_slot_iters", "ot_eps", "ot_iters", "gumbel_temp", "noc_v2_weight", "gate_count_weight", "gate_temp_final", "phi_gated_weight",   # aslot
               "n_inf_steps", "inf_lr", "spen_global_hidden", "spen_aux_w"):  # spen
         v = getattr(args, k)
         if v is not None:
@@ -2316,8 +2426,9 @@ if __name__ == "__main__":
                  "ml_attr", "ml_distill", "add_invar", "recon", "add_recon",
                  "noise_spectrum", "xnoise_consistency",
                  "phi_inject", "soft_geno_attr", "feas_filter", "soft_attr_label",
-                 "set_of_set", "noc_head_v2", "phi_rerank", "em_phi_feature",
-                 "noise_gate", "count_on_rerank"):  # Inc18 / SoS / NOC head / phi-rerank / em-phi / noise gate / count-on-rerank
+                 "set_of_set", "noc_head_v2", "gate_count", "log_per_noc", "gate_mass", "phi_gated",
+                 "phi_rerank", "em_phi_feature",
+                 "noise_gate", "count_on_rerank"):  # Inc18 / SoS / NOC head / gate-count / per-noc log / mass-gate / phi-gated / phi-rerank / em-phi / noise gate / count-on-rerank
         if getattr(args, flag):
             cfg[flag] = True
     if args.noise_gate_w is not None:
