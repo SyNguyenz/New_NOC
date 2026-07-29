@@ -1,29 +1,32 @@
 """kfold_donor_slot.py — GroupKFold(5) for the Donor-Slot (inc22) SetTransformer.
 
 "Nguyên's part", run as 5-fold GroupKFold grouped by donor-combo (like the notebook),
-using the repo's inc22 `SetTransformerMixture` (`code/models/set_transformer.py`) and the
-pretrained `Donor-Slot_Set_Transformer.pt` checkpoint as initialisation.
+using the repo's inc22 `SetTransformerMixture` (`code/models/set_transformer.py`) with the
+pretrained `Donor-Slot_Set_Transformer.pt` checkpoint available as initialisation.
 
-Task: contributor identification = which of 45 known donors are present in a mixture
-(the model's `logits_cls` head, targets = `y_*_set.npy`, 45-dim multi-hot). Reported
-per fold: donor-set exact-match (EM, oracle top-true-k decode) overall + per NOC, plus
-micro/macro-F1 on the multi-label presence.
+Two tasks (--task):
+  count  (default, well-posed) — predict NOC = number of contributors (target_noc, 1..5)
+         via the `logits_card` head, trained with class-weighted cross-entropy. This is the
+         notebook cell-14 target; metric = Macro-F1 + Micro-F1 over the 5 count classes.
+  donor  — contributor identification = which of 45 known donors are present (`logits_cls`,
+         targets `y_*_set.npy`), oracle top-true-k decode. NOTE: ill-posed under donor-combo
+         CV (each donor's single-source samples are held entirely in one fold); kept for the
+         record. See docs/superpowers/2026-07-29-kfold-donor-slot-results.md.
 
 Data (built beforehand by `data/prepare_data_set.py` + `features/enrich.py`):
-  tokens8_{train,val,test}.npy  (N,160,8)   mask_{...}.npy (N,160) bool
-  y_{...}_set.npy (N,45) float   noc_{...}.npy (N,)   meta_sample_names_{...}.json
-The three closed splits are concatenated into one pool; GroupKFold(5) then re-splits it
-by donor-combo (parsed from the sample-file names). `donor_geno`/`donor_geno_mask`/
-`owner_lut` are read from the checkpoint (baked buffers).
+  tokens8_{train,val,test}.npy (N,160,8)  mask_{...}.npy (N,160) bool
+  y_{...}_set.npy (N,45)  noc_{...}.npy (N,)  meta_sample_names_{...}.json
+The three closed splits are concatenated into one pool; GroupKFold(5) re-splits it by
+donor-combo (parsed from the sample-file names). donor_geno/donor_geno_mask/owner_lut are
+read from the checkpoint (baked buffers).
 
-IMPORTANT LEAKAGE CAVEAT: with --init pretrained (default), the checkpoint was trained on
-part of this same real GF pool, so finetune+eval on GroupKFold folds is optimistic. Use
---init scratch for a leak-free cross-validation number.
+LEAKAGE CAVEAT: --init pretrained uses a checkpoint trained on part of this same GF pool, so
+finetune+eval on the folds is optimistic. --init scratch (default) is leak-free.
 
 Usage:
   python code/kfold_donor_slot.py --ckpt /path/Donor-Slot_Set_Transformer.pt \
-      [--data-dir code/data --init pretrained --n-folds 5 --seed 42 --epochs 40 \
-       --out results/kfold_donor_slot]
+      [--data-dir code/data --task count --init scratch --n-folds 5 --seed 42 \
+       --epochs 60 --patience 12 --out results/kfold_donor_slot]
 """
 from __future__ import annotations
 
@@ -48,7 +51,6 @@ from data.prepare_data_set import parse_donors
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# inc22 model config (matches the Donor-Slot checkpoint; see train_set_transformer.py CFG)
 MODEL_CFG = dict(
     n_loci=24, d_locus=16, d_model=128, n_heads=4, n_isab=2, m_inducing=32,
     n_classes=45, dropout=0.1, n_token_feats=8, n_freq=8, d_num_emb=8,
@@ -58,24 +60,21 @@ SPLITS = ("train", "val", "test")
 
 
 class AsymmetricLoss(nn.Module):
-    """ASL (Ben-Baruch 2020) on the multi-label donor logits — verbatim from train_set_transformer."""
+    """ASL on the multi-label donor logits — verbatim from train_set_transformer."""
 
     def __init__(self, gamma_neg=4.0, gamma_pos=0.0, clip=0.05, eps=1e-8):
         super().__init__()
         self.gamma_neg = gamma_neg; self.gamma_pos = gamma_pos; self.clip = clip; self.eps = eps
 
     def forward(self, logits, targets):
-        xs_pos = torch.sigmoid(logits)
-        xs_neg = 1.0 - xs_pos
+        xs_pos = torch.sigmoid(logits); xs_neg = 1.0 - xs_pos
         if self.clip and self.clip > 0:
             xs_neg = (xs_neg + self.clip).clamp(max=1)
-        los_pos = targets * torch.log(xs_pos.clamp(min=self.eps))
-        los_neg = (1 - targets) * torch.log(xs_neg.clamp(min=self.eps))
-        loss = los_pos + los_neg
+        los = targets * torch.log(xs_pos.clamp(min=self.eps)) + \
+            (1 - targets) * torch.log(xs_neg.clamp(min=self.eps))
         pt = xs_pos * targets + xs_neg * (1 - targets)
         gamma = self.gamma_pos * targets + self.gamma_neg * (1 - targets)
-        loss *= (1 - pt) ** gamma
-        return -loss.mean()
+        return -(los * (1 - pt) ** gamma).mean()
 
 
 class PoolDataset(Dataset):
@@ -93,18 +92,15 @@ class PoolDataset(Dataset):
 
 
 def load_pool(data_dir: Path):
-    """Concat the closed splits into one pool + build a donor-combo group id per sample."""
+    """Concat the closed splits into one pool + a donor-combo group id per sample."""
     toks, masks, ys, nocs, groups = [], [], [], [], []
     for sp in SPLITS:
         tp = data_dir / f"tokens8_{sp}.npy"
         if not tp.is_file():
             raise SystemExit(f"Missing {tp}. Build data first: prepare_data_set.py + enrich.py")
-        toks.append(np.load(tp))
-        masks.append(np.load(data_dir / f"mask_{sp}.npy"))
-        ys.append(np.load(data_dir / f"y_{sp}_set.npy"))
-        nocs.append(np.load(data_dir / f"noc_{sp}.npy"))
-        names = json.loads((data_dir / f"meta_sample_names_{sp}.json").read_text())
-        for nm in names:
+        toks.append(np.load(tp)); masks.append(np.load(data_dir / f"mask_{sp}.npy"))
+        ys.append(np.load(data_dir / f"y_{sp}_set.npy")); nocs.append(np.load(data_dir / f"noc_{sp}.npy"))
+        for nm in json.loads((data_dir / f"meta_sample_names_{sp}.json").read_text()):
             groups.append("-".join(str(d) for d in sorted(parse_donors(str(nm)))))
     tokens = np.concatenate(toks); mask = np.concatenate(masks)
     y = np.concatenate(ys); noc = np.concatenate(nocs); groups = np.array(groups)
@@ -115,29 +111,18 @@ def load_pool(data_dir: Path):
 
 def build_model(sd, init: str, train_tokens=None, train_mask=None):
     """Construct the repo SetTransformerMixture. donor_geno/owner_lut always come from the
-    checkpoint (reference data, not learned). init='pretrained' loads the weights; 'scratch'
-    keeps random init and recomputes feature standardisation from the fold's train peaks."""
-    model = SetTransformerMixture(
-        donor_geno=sd["donor_geno"], donor_geno_mask=sd["donor_geno_mask"],
-        owner_lut=sd["owner_lut"], **MODEL_CFG,
-    ).to(DEVICE)
+    checkpoint. init='pretrained' loads weights; 'scratch' keeps random init and recomputes
+    feature standardisation from this fold's train peaks."""
+    model = SetTransformerMixture(donor_geno=sd["donor_geno"], donor_geno_mask=sd["donor_geno_mask"],
+                                  owner_lut=sd["owner_lut"], **MODEL_CFG).to(DEVICE)
     if init == "pretrained":
-        model.load_state_dict(sd, strict=False)      # keeps ckpt feat_mean/std too
-    else:  # scratch: recompute per-feature standardisation from this fold's train peaks
-        tk = train_tokens; mk = train_mask.astype(bool)
-        num = tk[:, :, 1:MODEL_CFG["n_token_feats"]][mk]
+        model.load_state_dict(sd, strict=False)
+    else:
+        mk = train_mask.astype(bool)
+        num = train_tokens[:, :, 1:MODEL_CFG["n_token_feats"]][mk]
         model.feat_mean.copy_(torch.tensor(num.mean(0), dtype=torch.float32, device=DEVICE))
         model.feat_std.copy_(torch.tensor(num.std(0) + 1e-6, dtype=torch.float32, device=DEVICE))
     return model
-
-
-@torch.no_grad()
-def infer_probs(model, loader):
-    model.eval(); P, Y, NOC = [], [], []
-    for tok, msk, y, noc in loader:
-        P.append(torch.sigmoid(model(tok.to(DEVICE), msk.to(DEVICE))["logits_cls"]).cpu().numpy())
-        Y.append(y.numpy()); NOC.append(noc.numpy())
-    return np.concatenate(P), np.concatenate(Y), np.concatenate(NOC)
 
 
 def topk_decode(probs, k_arr):
@@ -157,14 +142,29 @@ def per_noc_em(y_true, y_pred, noc):
     return out
 
 
-def evaluate(model, loader):
-    """Oracle top-true-k donor-set decode → EM overall + per NOC, plus micro/macro-F1."""
-    probs, y_true, noc = infer_probs(model, loader)
-    y_pred = topk_decode(probs, noc)                       # oracle k = true NOC
-    em = per_noc_em(y_true.astype(int), y_pred, noc)
-    micro = float(f1_score(y_true.astype(int), y_pred, average="micro", zero_division=0))
-    macro = float(f1_score(y_true.astype(int), y_pred, average="macro", zero_division=0))
-    return em, micro, macro
+@torch.no_grad()
+def evaluate(model, loader, task):
+    """Returns a metrics dict. count: macro/micro-F1 + acc over NOC 1..5.
+    donor: donor-set EM (oracle top-true-k) + micro/macro-F1."""
+    model.eval(); Lc, Pd, Y, NOC = [], [], [], []
+    for tok, msk, y, noc in loader:
+        out = model(tok.to(DEVICE), msk.to(DEVICE))
+        Lc.append(out["logits_card"].cpu().numpy())
+        Pd.append(torch.sigmoid(out["logits_cls"]).cpu().numpy())
+        Y.append(y.numpy()); NOC.append(noc.numpy())
+    Y = np.concatenate(Y).astype(int); NOC = np.concatenate(NOC)
+    if task == "count":
+        pred = np.concatenate(Lc).argmax(1) + 1                       # 1..5
+        labels = [1, 2, 3, 4, 5]
+        return {"macro_f1": round(float(f1_score(NOC, pred, average="macro", labels=labels, zero_division=0)), 4),
+                "micro_f1": round(float(f1_score(NOC, pred, average="micro", labels=labels, zero_division=0)), 4),
+                "acc": round(float((pred == NOC).mean()), 4),
+                "per_class_f1": {str(k): round(float(v), 4) for k, v in
+                                 zip(labels, f1_score(NOC, pred, average=None, labels=labels, zero_division=0))}}
+    probs = np.concatenate(Pd); yp = topk_decode(probs, NOC)
+    return {"em": per_noc_em(Y, yp, NOC),
+            "micro_f1": round(float(f1_score(Y, yp, average="micro", zero_division=0)), 4),
+            "macro_f1": round(float(f1_score(Y, yp, average="macro", zero_division=0)), 4)}
 
 
 def run_fold(cfg, sd, tr_idx, va_idx, tokens, mask, y, noc):
@@ -173,73 +173,82 @@ def run_fold(cfg, sd, tr_idx, va_idx, tokens, mask, y, noc):
     va_dl = DataLoader(PoolDataset(tokens[va_idx], mask[va_idx], y[va_idx], noc[va_idx]),
                        batch_size=512, shuffle=False)
     model = build_model(sd, cfg.init, tokens[tr_idx], mask[tr_idx])
-    criterion = AsymmetricLoss()
+    if cfg.task == "count":
+        w = 1.0 / np.clip(np.bincount(noc[tr_idx] - 1, minlength=5).astype(float), 1, None)
+        cw = torch.tensor(w / w.mean(), dtype=torch.float32, device=DEVICE)
+
+        def loss_fn(out, yb, nb):
+            return F.cross_entropy(out["logits_card"], nb - 1, weight=cw)
+        sel = "macro_f1"
+    else:
+        asl = AsymmetricLoss()
+
+        def loss_fn(out, yb, nb):
+            return asl(out["logits_cls"], yb)
+        sel = "micro_f1"
+
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=1e-6)
-    best_micro, best_state, wait = -1.0, None, 0
+    best, best_state, wait = -1.0, None, 0
     for ep in range(1, cfg.epochs + 1):
         model.train()
-        for tok, msk, yb, _ in tr_dl:
-            logits = model(tok.to(DEVICE), msk.to(DEVICE))["logits_cls"]
-            loss = criterion(logits, yb.to(DEVICE))
+        for tok, msk, yb, nb in tr_dl:
+            out = model(tok.to(DEVICE), msk.to(DEVICE))
+            loss = loss_fn(out, yb.to(DEVICE), nb.to(DEVICE))
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
         sched.step()
-        _, micro, _ = evaluate(model, va_dl)
-        if micro > best_micro:
-            best_micro, wait = micro, 0
+        m = evaluate(model, va_dl, cfg.task)[sel]
+        if m > best:
+            best, wait = m, 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             wait += 1
         if ep % 10 == 0 or ep == 1:
-            print(f"    ep{ep:3d}  val_micro_f1={micro:.4f}  best={best_micro:.4f}")
+            print(f"    ep{ep:3d}  val_{sel}={m:.4f}  best={best:.4f}")
         if wait >= cfg.patience:
-            print(f"    early stop @ ep{ep}  best={best_micro:.4f}"); break
+            print(f"    early stop @ ep{ep}  best={best:.4f}"); break
     if best_state is not None:
         model.load_state_dict(best_state)
-    em, micro, macro = evaluate(model, va_dl)
-    return {"em": em, "micro_f1": round(micro, 4), "macro_f1": round(macro, 4)}
+    return evaluate(model, va_dl, cfg.task)
 
 
 def run_kfold(cfg, sd, tokens, mask, y, noc, groups):
     gkf = GroupKFold(n_splits=cfg.n_folds)
     per_fold = []
-    print(f"\nGroupKFold({cfg.n_folds})  init={cfg.init}  device={DEVICE}  "
+    print(f"\nGroupKFold({cfg.n_folds})  task={cfg.task}  init={cfg.init}  device={DEVICE}  "
           f"pool={len(tokens)}  groups={len(np.unique(groups))}")
     for fold, (tr_idx, va_idx) in enumerate(gkf.split(tokens, y, groups), 1):
-        t0 = time.time()
-        torch.manual_seed(cfg.seed + fold); np.random.seed(cfg.seed + fold)
+        t0 = time.time(); torch.manual_seed(cfg.seed + fold); np.random.seed(cfg.seed + fold)
         print(f"\n  Fold {fold}/{cfg.n_folds}  train={len(tr_idx)}  val={len(va_idx)}  "
               f"val_groups={len(np.unique(groups[va_idx]))}")
-        r = run_fold(cfg, sd, tr_idx, va_idx, tokens, mask, y, noc)
-        r["fold"] = fold
+        r = run_fold(cfg, sd, tr_idx, va_idx, tokens, mask, y, noc); r["fold"] = fold
         per_fold.append(r)
-        print(f"  Fold {fold}: EM={r['em']['overall']:.4f}  micro-F1={r['micro_f1']:.4f}  "
-              f"macro-F1={r['macro_f1']:.4f}  ({time.time()-t0:.0f}s)  per-NOC EM={r['em']}")
-    ems = [r["em"]["overall"] for r in per_fold]
-    micros = [r["micro_f1"] for r in per_fold]
-    macros = [r["macro_f1"] for r in per_fold]
+        extra = f"acc={r['acc']:.4f}" if cfg.task == "count" else f"EM={r['em']['overall']:.4f}"
+        print(f"  Fold {fold}: macro-F1={r['macro_f1']:.4f}  micro-F1={r['micro_f1']:.4f}  "
+              f"{extra}  ({time.time()-t0:.0f}s)")
+    def ms(key):
+        v = [r[key] for r in per_fold]
+        return round(float(np.mean(v)), 4), round(float(np.std(v)), 4)
+    macro_m, macro_s = ms("macro_f1"); micro_m, micro_s = ms("micro_f1")
     results = {
-        "model": "Donor-Slot SetTransformer (inc22)",
-        "init": cfg.init,
-        "task": "contributor identification (45-donor presence, logits_cls)",
+        "model": "Donor-Slot SetTransformer (inc22)", "task": cfg.task, "init": cfg.init,
         "per_fold": per_fold,
-        "em_mean": round(float(np.mean(ems)), 4), "em_std": round(float(np.std(ems)), 4),
-        "micro_f1_mean": round(float(np.mean(micros)), 4), "micro_f1_std": round(float(np.std(micros)), 4),
-        "macro_f1_mean": round(float(np.mean(macros)), 4), "macro_f1_std": round(float(np.std(macros)), 4),
+        "macro_f1_mean": macro_m, "macro_f1_std": macro_s,
+        "micro_f1_mean": micro_m, "micro_f1_std": micro_s,
         "config": {"n_folds": cfg.n_folds, "seed": cfg.seed, "epochs": cfg.epochs, "lr": cfg.lr},
-        "leakage_caveat": (
-            "init=pretrained: checkpoint was trained on part of this real GF pool; "
-            "finetune+eval on GroupKFold folds is optimistic. Use --init scratch for a "
-            "leak-free number." if cfg.init == "pretrained" else
-            "init=scratch: leak-free — each fold trains from random init on its own train split."
-        ),
     }
-    print(f"\n{'='*64}")
-    print(f"Donor-Slot SetTransformer — GroupKFold({cfg.n_folds}) — init={cfg.init}")
-    print(f"  Donor-set EM : {results['em_mean']:.4f} ± {results['em_std']:.4f}")
-    print(f"  Micro-F1     : {results['micro_f1_mean']:.4f} ± {results['micro_f1_std']:.4f}")
-    print(f"  Macro-F1     : {results['macro_f1_mean']:.4f} ± {results['macro_f1_std']:.4f}")
+    if cfg.task == "count":
+        results["acc_mean"], results["acc_std"] = ms("acc")
+    if cfg.init == "pretrained":
+        results["leakage_caveat"] = ("checkpoint trained on part of this GF pool; "
+                                     "finetune+eval on the folds is optimistic — use --init scratch.")
+    print(f"\n{'='*64}\nDonor-Slot SetTransformer — GroupKFold({cfg.n_folds}) — "
+          f"task={cfg.task} init={cfg.init}")
+    print(f"  Macro-F1 : {macro_m:.4f} ± {macro_s:.4f}")
+    print(f"  Micro-F1 : {micro_m:.4f} ± {micro_s:.4f}")
+    if cfg.task == "count":
+        print(f"  Accuracy : {results['acc_mean']:.4f} ± {results['acc_std']:.4f}")
     print('='*64)
     return results
 
@@ -248,11 +257,12 @@ def resolve_config(argv=None):
     p = argparse.ArgumentParser(description="GroupKFold(5) Donor-Slot SetTransformer.")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--data-dir", default=str(ROOT / "data"))
-    p.add_argument("--init", choices=["pretrained", "scratch"], default="pretrained")
+    p.add_argument("--task", choices=["count", "donor"], default="count")
+    p.add_argument("--init", choices=["pretrained", "scratch"], default="scratch")
     p.add_argument("--n-folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--patience", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--patience", type=int, default=12)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--out", default=str(ROOT.parent / "results" / "kfold_donor_slot"))
@@ -274,10 +284,11 @@ def main(argv=None):
     tokens, mask, y, noc, groups = load_pool(data_dir)
     results = run_kfold(cfg, sd, tokens, mask, y, noc, groups)
     out.mkdir(parents=True, exist_ok=True)
-    tag = cfg.init
+    tag = f"{cfg.task}_{cfg.init}"
     (out / f"kfold_metrics_{tag}.json").write_text(json.dumps(results, indent=2))
+    scores = [r["acc"] if cfg.task == "count" else r["em"]["overall"] for r in results["per_fold"]]
     (out / f"per_fold_scores_{tag}.json").write_text(json.dumps(
-        {f"DonorSlot_SetTransformer_{tag}": [r["em"]["overall"] for r in results["per_fold"]]}, indent=2))
+        {f"DonorSlot_{tag}": scores}, indent=2))
     print(f"\nSaved -> {out}")
 
 
