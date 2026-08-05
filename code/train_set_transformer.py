@@ -52,7 +52,24 @@ import phi_rerank as pr
 
 # Data dir (the orchestrator sets STR_DATA_DIR to the enriched, dev-split data_w).
 DATA_DIR = Path(os.environ.get("STR_DATA_DIR", str(ROOT / "data_insilico_w")))
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _pick_device() -> torch.device:
+    """CUDA (Kaggle/Colab) -> MPS (Apple Silicon) -> CPU. Override with STR_DEVICE=cpu|mps|cuda.
+
+    CUDA stays first so an existing GPU run is unchanged; MPS lets the same code train on a Mac.
+    """
+    forced = os.environ.get("STR_DEVICE", "").strip().lower()
+    if forced:
+        return torch.device(forced)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = _pick_device()
 ALLELE_OFF = 30
 LUT_W = 1024
 
@@ -79,6 +96,8 @@ def set_seed(seed: int) -> torch.Generator:
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if DEVICE.type == "mps":
+        torch.mps.manual_seed(seed)
     g = torch.Generator(); g.manual_seed(seed)
     return g
 
@@ -156,6 +175,40 @@ def posthoc_cardinality(P_val, y_val, P_test, lam=0.02):
 def per_noc_em(y_true, y_pred, noc):
     e = np.all(y_true == y_pred, axis=1)
     return [e.mean()] + [e[noc == j].mean() if (noc == j).sum() else float("nan") for j in range(1, 6)]
+
+
+def loco_decode(L_te, P_te, y_te, noc_te, PHt, combo_id, P_va, y_va):
+    """LEAVE-ONE-COMBO-OUT fit of the post-hoc decode stage (phi-rerank alpha + RF count).
+
+    Every real donor-combo lives in test now (the network trains on in-silico only, so no real combo
+    has to be spent as a fitting set). Each combo is scored by an (alpha, RF) pair fit on the OTHER
+    combos only — group-disjoint exactly like the old held-out val, but every real mixture becomes
+    reportable instead of ~15% of them. The single-source test rows form one extra group, fit on all
+    mixtures. Real val (single-source) is always in the RF fit set: it supplies the k=1 examples.
+
+    Returns (rank_te, k_post, alphas_per_group, alpha_full). alpha_full is fit on ALL mixtures — that
+    is the artifact you would ship; the per-group alphas exist only to keep the estimate honest.
+    """
+    mix = combo_id >= 0
+    groups = [np.where(combo_id == c)[0] for c in np.unique(combo_id[mix])]
+    ss = np.where(~mix)[0]
+    if len(ss):
+        groups.append(ss)
+    alpha_full = float(pr.tune_alpha(L_te[mix], PHt[mix], y_te[mix], noc_te[mix])) if mix.any() else 0.0
+
+    rank_te = np.zeros(L_te.shape, dtype=np.float64)
+    k_post = np.ones(len(L_te), dtype=int)
+    alphas = []
+    for g in groups:
+        held = np.zeros(len(L_te), bool); held[g] = True
+        fit = mix & ~held                       # other combos only — a group never fits on itself
+        assert not fit[g].any(), "leave-one-combo-out violated"
+        a = float(pr.tune_alpha(L_te[fit], PHt[fit], y_te[fit], noc_te[fit])) if fit.any() else alpha_full
+        alphas.append(a)
+        rank_te[g] = pr.rerank_scores(L_te[g], PHt[g], a)
+        P_fit = np.concatenate([P_te[fit], P_va]); y_fit = np.concatenate([y_te[fit], y_va])
+        k_post[g] = posthoc_cardinality(P_fit, y_fit, P_te[g])
+    return rank_te, k_post, alphas, alpha_full
 
 
 # ── Datasets ─────────────────────────────────────────────────────────────────
@@ -441,14 +494,27 @@ def train(seed: int, out_subdir: str):
     L_va, P_va, y_va, noc_va = infer(val_ds)
 
     dg = donor_geno.cpu().numpy(); dgm = donor_geno_mask.cpu().numpy()
-    PHv = pr.deconv_phi(val_ds.tokens.numpy(), val_ds.mask.numpy(), dg, dgm)
     PHt = pr.deconv_phi(test_ds.tokens.numpy(), test_ds.mask.numpy(), dg, dgm)
-    alpha_pr = pr.tune_alpha(L_va, PHv, y_va, noc_va)
-    rank_te = pr.rerank_scores(L_te, PHt, alpha_pr)        # phi-rerank the RANKING (which donors / decode order)
-    print(f"phi_rerank: val-tuned alpha={alpha_pr}")
 
-    # COUNT = post-hoc RF on the PROB profile (original inc22; count-on-rerank trades N3/N4 -> excluded)
-    k_post = posthoc_cardinality(P_va, y_va, P_te)
+    # Decode = phi-rerank the RANKING + post-hoc RF count on the PROBS, both fit LEAVE-ONE-COMBO-OUT.
+    # (count-on-rerank trades N3/N4 for N5 -> excluded; count stays on probs.)
+    cid_p = DATA_DIR / "combo_id_test.npy"
+    if cid_p.exists():
+        combo_id = np.load(cid_p).astype(int)
+        rank_te, k_post, alphas, alpha_pr = loco_decode(
+            L_te, P_te, y_te_true, noc_te, PHt, combo_id, P_va, y_va)
+        n_groups = len(alphas)
+        decode_desc = "phi_rerank(ranking) + posthoc_rf_count(probs), leave-one-combo-out fit"
+        print(f"phi_rerank: LOCO over {n_groups} groups, alpha/group={alphas}, shipped alpha={alpha_pr}")
+    else:
+        # legacy bundle (real mixtures still sit in val): tune alpha and fit the RF on val
+        PHv = pr.deconv_phi(val_ds.tokens.numpy(), val_ds.mask.numpy(), dg, dgm)
+        alpha_pr = float(pr.tune_alpha(L_va, PHv, y_va, noc_va)); alphas = [alpha_pr]; n_groups = 1
+        rank_te = pr.rerank_scores(L_te, PHt, alpha_pr)
+        k_post = posthoc_cardinality(P_va, y_va, P_te)
+        decode_desc = "phi_rerank(ranking) + posthoc_rf_count(probs), val-fit [legacy: no combo_id_test]"
+        print(f"phi_rerank: val-tuned alpha={alpha_pr} (legacy path — combo_id_test.npy missing)")
+
     y_te_pred = topk_decode(rank_te, k_post)
     em_post = per_noc_em(y_te_true, y_te_pred, noc_te)
     oracle = per_noc_em(y_te_true, topk_decode(rank_te, noc_te), noc_te)
@@ -492,8 +558,11 @@ def train(seed: int, out_subdir: str):
     out_dict = {
         "model": "set_transformer", "config": cfg,
         "best_val_macro_recall": round(best_sel, 4), "best_epoch": best_epoch,
-        "decode": "phi_rerank(ranking) + posthoc_rf_count(probs)",
+        "decode": decode_desc,
         "phi_rerank_alpha": float(alpha_pr),
+        "phi_rerank_alpha_per_group": alphas,
+        "n_decode_groups": n_groups,
+        "n_test_mixtures": int((noc_te >= 2).sum()),
         "em_post_hoc": round(float(em_post[0]), 4),
         "oracle_em": round(float(oracle[0]), 4),
         "count_acc": round(count_acc, 4),
