@@ -32,12 +32,16 @@ MAX_SEQ = 160
 RANDOM_SEED = 42
 PY = sys.executable
 
-# ── donor split (verbatim: prepare_data_set.py) ────────────────────────────
+# ── donor split (verbatim: prepare_data_set.py) — 10-fold, each donor unknown once ──
 ALL_DONORS = list(range(1, 51))
+N_FOLDS = 10
+FOLD = int(os.environ.get("STR_FOLD", "0"))
+if not 0 <= FOLD < N_FOLDS:
+    raise SystemExit(f"STR_FOLD must be in [0, {N_FOLDS - 1}], got {FOLD}")
 _rng = np.random.default_rng(RANDOM_SEED)
 _shuffled = _rng.permutation(ALL_DONORS).tolist()
-UNKNOWN_DONORS = sorted(_shuffled[:5])
-KNOWN_DONORS = sorted(_shuffled[5:])
+UNKNOWN_DONORS = sorted(_shuffled[5 * FOLD: 5 * FOLD + 5])
+KNOWN_DONORS = sorted(set(ALL_DONORS) - set(UNKNOWN_DONORS))
 KNOWN_SET = set(KNOWN_DONORS)
 
 
@@ -199,7 +203,10 @@ def csv_pass():
     closed_idx = np.where(is_closed)[0]
     open_idx = np.where(~is_closed)[0]
     print(f"  Closed-set: {len(closed_idx)}  Open-set: {len(open_idx)}")
-    rng_split = np.random.default_rng(RANDOM_SEED)
+    # Multi-person: EVERY closed combo -> test. The network trains on in-silico only (build_train
+    # discards real mixtures), so real combos parked in `train` protected nothing and just shrank the
+    # evaluation. They are excluded from in-silico generation instead, and the post-hoc decode is fit
+    # leave-one-combo-out at eval time via combo_id_test.npy. val stays single-source (k=1 rows).
     sample_combo = {}
     for i in closed_idx:
         sf = sample_files[i]
@@ -211,33 +218,25 @@ def csv_pass():
     for i, combo in sample_combo.items():
         combos_by_noc.setdefault(len(combo), set()).add(combo)
     combos_by_noc = {noc: sorted(combos) for noc, combos in combos_by_noc.items()}
-    combo_split = {}
+    all_combos = sorted({c for cs in combos_by_noc.values() for c in cs})
+    combo_to_id = {c: j for j, c in enumerate(all_combos)}
     split_policy_combos = {"train": {}, "val": {}, "test": {}}
     for noc_i, combos in sorted(combos_by_noc.items()):
-        shuffled = [tuple(c) for c in rng_split.permutation(combos)]
-        test_combo = shuffled[-1]
-        val_combo = shuffled[-2]
-        train_combos_noc = shuffled[:-2]
-        combo_split[test_combo] = "test"
-        combo_split[val_combo] = "val"
-        for c in train_combos_noc:
-            combo_split[c] = "train"
-        split_policy_combos["test"][f"NOC{noc_i}"] = [[int(d) for d in test_combo]]
-        split_policy_combos["val"][f"NOC{noc_i}"] = [[int(d) for d in val_combo]]
-        split_policy_combos["train"][f"NOC{noc_i}"] = [[int(d) for d in c] for c in train_combos_noc]
-        print(f"  NOC={noc_i} combos: train={[[int(d) for d in c] for c in train_combos_noc]}"
-              f"  val={[int(d) for d in val_combo]}  test={[int(d) for d in test_combo]}")
-    multi_train = [i for i, c in sample_combo.items() if combo_split[c] == "train"]
-    multi_val = [i for i, c in sample_combo.items() if combo_split[c] == "val"]
-    multi_test = [i for i, c in sample_combo.items() if combo_split[c] == "test"]
+        split_policy_combos["test"][f"NOC{noc_i}"] = [[int(d) for d in c] for c in combos]
+        n_samp = sum(1 for c in sample_combo.values() if len(c) == noc_i)
+        print(f"  NOC={noc_i}: {len(combos)} combos -> test ({n_samp} samples)")
+    multi_test = sorted(sample_combo)
     single_idx = np.array([i for i in closed_idx if int(nocs[i]) == 1])
     donor_labels = np.array([KNOWN_DONORS.index(sample_donors[sample_files[i]][0]) for i in single_idx])
     ss_train, ss_tmp, _, ss_lbl_tmp = train_test_split(
         single_idx, donor_labels, test_size=0.30, random_state=RANDOM_SEED, stratify=donor_labels)
     ss_val, ss_test = train_test_split(ss_tmp, test_size=0.50, random_state=RANDOM_SEED, stratify=ss_lbl_tmp)
-    idx_train = np.concatenate([ss_train, multi_train])
-    idx_val = np.concatenate([ss_val, multi_val])
-    idx_test = np.concatenate([ss_test, multi_test])
+    idx_train = ss_train                                   # single-source only
+    idx_val = ss_val                                       # single-source only (k=1 rows for RF count)
+    idx_test = np.concatenate([ss_test, np.array(multi_test, dtype=ss_test.dtype)])
+    combo_id_all = np.full(len(sample_files), -1, dtype=np.int32)   # -1 = single-source
+    for i, c in sample_combo.items():
+        combo_id_all[i] = combo_to_id[c]
     splits = {"train": idx_train, "val": idx_val, "test": idx_test, "open": open_idx}
     for name, ix in splits.items():
         n_ss = int((nocs[ix] == 1).sum())
@@ -251,6 +250,7 @@ def csv_pass():
         np.save(DATA_DIR / f"Xflat_{split}.npy", flat_arr[ix])
         np.save(DATA_DIR / f"y_{split}_set.npy", labels[ix])
         np.save(DATA_DIR / f"noc_{split}.npy", nocs[ix])
+        np.save(DATA_DIR / f"combo_id_{split}.npy", combo_id_all[ix])
     for split, ix in splits.items():
         names = [sample_files[i] for i in ix]
         with open(DATA_DIR / f"meta_sample_names_{split}.json", "w") as f:
@@ -261,16 +261,24 @@ def csv_pass():
         "flat_cols": flat_cols, "n_flat": n_flat, "max_seq": MAX_SEQ,
         "known_donors": KNOWN_DONORS, "unknown_donors": UNKNOWN_DONORS, "random_seed": RANDOM_SEED,
         "n_classes": 45, "split_sizes": {k: len(v) for k, v in splits.items()},
+        "combo_list": [[int(d) for d in c] for c in all_combos],
         "split_policy": {
             "description": (
                 "Single-source (NOC=1): stratified by donor (all 45 donors in every split). "
-                "Multi-person (NOC>=2): group-aware by donor-combo — entire combo "
-                "assigned to one split, no combo spans train and test."),
+                "Multi-person (NOC>=2): EVERY closed donor-combo goes to test — the network trains "
+                "on in-silico mixtures only, so no real combo is spent on train/val. All of them are "
+                "excluded from in-silico generation, and the post-hoc decode (phi-rerank alpha + RF "
+                "count) is fit leave-one-combo-out via combo_id_test.npy. val is single-source only."),
             "multi_person_combos": split_policy_combos,
         },
     }
     with open(DATA_DIR / "meta_set.json", "w") as f:
         json.dump(meta, f, indent=2)
+    # fold provenance kept OUT of meta_set.json so fold 0 stays byte-identical to the published run
+    with open(DATA_DIR / "fold_info.json", "w") as f:
+        json.dump({"fold": FOLD, "n_folds": N_FOLDS, "random_seed": RANDOM_SEED,
+                   "unknown_donors": UNKNOWN_DONORS, "known_donors": KNOWN_DONORS}, f, indent=2)
+    print(f"  FOLD {FOLD}/{N_FOLDS}  unknown={UNKNOWN_DONORS}")
 
     # ===== extract_size: per-peak size from the SAME `raw` (verbatim logic) =====
     print("Building per-peak size from the same CSVs …")

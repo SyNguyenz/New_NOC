@@ -77,8 +77,23 @@ def build_bin_size():
     return out
 
 
-# Real test combos (donor IDs) — for fidelity check / version-A generation
-TEST_COMBOS = {2: [(31, 32)], 3: [(46, 47, 48)], 4: [(33, 34, 35, 36)], 5: [(31, 32, 33, 34, 35)]}
+# Real val/test combos (donor IDs) — for fidelity check / version-A generation and, critically, for
+# EXCLUDING them from the in-silico train (build_train). READ FROM meta_set.json so they follow the
+# donor fold: prepare_data_set/preprocess pick val/test combos from whatever donors are KNOWN in that
+# fold, so hard-coding them would recreate the fold's real val/test combos inside the synthetic train.
+# The fallbacks are the fold-0 literals, so a meta written before split_policy existed still works.
+def _combos_from_meta(split, fallback):
+    mp = META.get("split_policy", {}).get("multi_person_combos", {}).get(split)
+    if mp is None:                      # pre-split_policy meta -> fall back to the fold-0 literals
+        return fallback                 # NOTE: `{}` is a real answer (no combo in that split), not missing
+    return {int(k.replace("NOC", "")): [tuple(sorted(int(d) for d in c)) for c in combos]
+            for k, combos in mp.items()}
+
+
+TEST_COMBOS = _combos_from_meta(
+    "test", {2: [(31, 32)], 3: [(46, 47, 48)], 4: [(33, 34, 35, 36)], 5: [(31, 32, 33, 34, 35)]})
+VAL_COMBOS = _combos_from_meta(
+    "val", {2: [(33, 34)], 3: [(41, 42, 43)], 4: [(32, 33, 34, 35)], 5: [(35, 36, 37, 38, 39)]})
 
 GAMMA_SHAPE = 10.0   # per-peak jitter CV ~ 1/sqrt(shape) ~ 0.32
 # AT: real test (PROVEDIt) retains peaks to ~10 RFU (p10=10); the old 14 DROPPED real's faint minor tail
@@ -405,8 +420,8 @@ def fidelity_check(pool, rng):
 def build_train(n_mix, pool, rng, exclude_test=True, oversample_test=0, noc_p=None):
     OUT.mkdir(exist_ok=True)
     test_set = {tuple(sorted(c)) for cs in TEST_COMBOS.values() for c in cs}
-    val_combos = {2: [(33, 34)], 3: [(41, 42, 43)], 4: [(32, 33, 34, 35)], 5: [(35, 36, 37, 38, 39)]}
-    val_set = {tuple(sorted(c)) for cs in val_combos.values() for c in cs}
+    val_set = {tuple(sorted(c)) for cs in VAL_COMBOS.values() for c in cs}
+    print(f"  excluding real combos from in-silico train — test={sorted(test_set)} val={sorted(val_set)}")
     # keep real single-source train too
     Xtr = np.load(DATA / "Xflat_train.npy"); ytr = np.load(DATA / "y_train_set.npy"); ntr = np.load(DATA / "noc_train.npy")
     ss = ntr == 1
@@ -478,7 +493,12 @@ def build_train(n_mix, pool, rng, exclude_test=True, oversample_test=0, noc_p=No
             src = DATA / f"{pre}{split}{suf}.npy"
             if src.exists():
                 shutil.copy(src, OUT / src.name)
-    for f in ["tokens_open.npy", "mask_open.npy", "Xflat_open.npy", "size_open.npy", "meta_set.json"]:
+    # combo_id_{val,test}: leave-one-combo-out grouping for the post-hoc decode fit (-1 = single-source).
+    # donor_geno*: CoSA/feas_filter and phi_rerank need them at train time — copied here so the
+    # published OUT dir is self-contained and needs no follow-up cp before zipping/uploading.
+    for f in ["tokens_open.npy", "mask_open.npy", "Xflat_open.npy", "size_open.npy", "meta_set.json",
+              "combo_id_test.npy", "combo_id_val.npy", "fold_info.json",
+              "donor_geno.npy", "donor_geno_mask.npy"]:
         if (DATA / f).exists():
             shutil.copy(DATA / f, OUT / f)
     print(f"Saved {len(Xf)} train ({len(Xf_new)} in-silico + {ss.sum()} real SS) -> {OUT}")

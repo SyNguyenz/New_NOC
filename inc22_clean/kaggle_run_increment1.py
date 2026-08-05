@@ -47,7 +47,7 @@ def stage_raw_to_insilico():
     """data_raw/ -> data/ (real phi/condition/genotypes/attr/size) -> make_insilico -> data_insilico_w/.
     Exactly the proven LOCAL prep sequence (kaggle_run_increment1.py header)."""
     assert (PROJ / "data_raw").exists(), f"data_raw/ not found at {PROJ/'data_raw'} (needs the PROVEDIt CSVs)"
-    run([PY, "data/prepare_data_set.py"])          # raw GF29cycles CSVs -> base tokens/mask/Xflat/y/noc/meta_set
+    run([PY, "prepare_data_set.py"])               # raw GF29cycles CSVs -> base tokens/mask/Xflat/y/noc/meta_set
     run([PY, "build_donor_geno.py"])               # raw Known-Genotypes xlsx -> donor_geno.npy + donor_geno_mask.npy
     run([PY, "extract_phi_condition.py"])          # real phi/condition/template/Q  -> data/
     run([PY, "synth/extract_genotypes.py"])        # consensus donor genotypes      -> data/donor_geno*.npy
