@@ -539,7 +539,7 @@ def main():
     elif args.realistic:
         PROP_MODE = "realistic"
     assert PROP_MODE in ("original", "realistic", "wide"), f"bad PROP_MODE {PROP_MODE}"
-    print(f"proportion model: {PROP_MODE.upper()}")
+    print(f"generator: {'PEAK MODEL' if PEAK_MODEL else 'OVERLAY'} | proportion model: {PROP_MODE.upper()}")
     rng = np.random.default_rng(args.seed)
     pool = build_ss_pool()
     noc_p = None
