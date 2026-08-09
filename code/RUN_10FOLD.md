@@ -28,47 +28,33 @@ Fold = cắt permutation seed-42 của `[1..50]` thành 10 khối 5 người; `S
 
 ---
 
-## 2. Thiết kế split (để đọc kết quả cho đúng)
+## 2. Split & flags
 
 - **NOC=1**: stratify theo donor → mọi donor có mặt ở train + val + test.
-- **NOC≥2**: **toàn bộ** combo thật nằm ở `test`; `train`/`val` chỉ có single-source.
-  Network train trên in-silico, mọi combo thật bị loại khỏi sinh in-silico.
-- **Decode**: `alpha` (phi-rerank) và RF count được fit **leave-one-combo-out** — mỗi combo được chấm
-  bởi bộ decode fit trên các combo khác + val single-source (`combo_id_test.npy` giữ grouping).
-  Đây là **cross-validated estimate**, không phải một held-out set duy nhất.
+- **NOC≥2**: toàn bộ combo thật nằm ở `test`; `train`/`val` chỉ single-source.
+- **Decode**: `alpha` (phi-rerank) + count fit leave-one-combo-out theo `combo_id_test.npy`.
+- **Checkpoint**: chọn theo in-silico DEV, không early stopping → `best_model.pt` + `last_model.pt`.
 
-### Generator: overlay, không phải peak model
+Env flag (mặc định đã đúng, chỉ đổi khi cần):
 
-`make_insilico` có hai đường sinh. Mặc định giờ là **overlay profile NOC1 thật** (`STR_PEAK_MODEL=0`).
-Đo trên real test, khớp per-NOC:
+| flag | mặc định | tác dụng |
+|---|---|---|
+| `STR_FOLD` | `0` | chọn khối 5 donor unknown |
+| `STR_PEAK_MODEL` | `0` | `0` = overlay profile NOC1 thật, `1` = peak model |
+| `STR_ENRICH_AFTER_FEAS` | `1` | enrich sau feasibility filter |
+| `STR_DEVICE` | auto | ép `cuda` / `mps` / `cpu` |
+| `STR_NOC_ARM` | `0` | tương đương `--noc_arm` |
 
-| thống kê | REAL | peak model | **overlay** |
-|---|---:|---:|---:|
-| peak không donor nào giải thích | 0.17–0.22 | 0.036–0.040 | **0.19–0.24** |
-| n_peaks | 119–142 | 92–125 | **133–160** |
-| MAC | 11–12 | 7–9 | **12–14** |
-| max / median peak | 12–18 | 91–113 | **17–20** |
+### `--noc_arm`
 
-Overlay lệch đều về **phía khó** trên mọi trục. Hệ quả: điểm trên in-silico DEV sẽ **thấp hơn** điểm
-real — đó là ước lượng bi quan, đừng đọc nhầm thành model kém đi.
+| arm | thay đổi |
+|---|---|
+| 0 | baseline |
+| 1 | `+ 0.05·SmoothL1(Σgate, NOC)` |
+| 2 | arm 1, bỏ `logits_card` + post-hoc RF; đếm bằng `tierA_count` |
+| 3 | arm 2, bỏ CORN |
 
-### Enrich chạy SAU feasibility filter
-
-Các cột enrich (`h/tot` trong locus, rank, `h/gmax`, `n/10`, tỉ lệ stutter) là đại lượng **tương đối
-trong locus**. Tính chúng trên tập peak chưa lọc thì nhiễu 0-carrier bóp méo đặc trưng của peak thật,
-kể cả khi `feas_filter` bỏ peak nhiễu sau đó. Đo trên real test: **+0.048** macro-over-NOC recall,
-không cần train lại. `STR_ENRICH_AFTER_FEAS=0` trả về thứ tự cũ.
-
-### Chọn checkpoint
-
-Selection = macro-over-NOC oracle Recall@k trên **in-silico DEV**, **không** early stopping (metric bão
-hoà sớm nên patience chỉ dừng trên nhiễu). Lưu `best_model.pt` (epoch DEV tốt nhất) và `last_model.pt`.
-
-Từng có một `monitor` split (vài combo thật, chỉ để chọn checkpoint) vì DEV khi đó **đảo dấu** so với
-real. Sau khi sửa generator, khác biệt giữa các epoch co từ 0.238 xuống **<0.01** macro-over-NOC, và
-checkpoint chọn theo DEV còn hơn chọn theo monitor về oracle (0.9700 vs 0.9636) — monitor không còn
-đáng 4 combo, đã gỡ. Đổi lại **mất dụng cụ báo drift**: nếu sau này đổi generator/pipeline thì phải
-dựng lại tín hiệu real trong vòng train trước khi tin số.
+Mọi arm ghi thêm `count_acc_gate`, `count_macro_f1_gate_mix`, `corr_sumgate_noc` vào `metrics.json`.
 
 ---
 
@@ -206,7 +192,15 @@ assert m['split_policy']['multi_person_combos']['val'] == {}, 'dataset build b�
 
 ```python
 !INSILICO_W=/kaggle/input/noc-inc22-fold1/data_insilico_w \
-    python kaggle_run_increment1.py --seed 42 --out_subdir inc22_fixed_aslot_fold1
+    python kaggle_run_increment1.py --seed 42 --out_subdir inc22_fixed_aslot_fold1 --noc_arm 0
+```
+
+Ba arm chạy trên cùng một dataset, chỉ đổi `--noc_arm` và `--out_subdir`:
+
+```python
+for arm in (1, 2, 3):
+    !INSILICO_W=/kaggle/input/noc-inc22-fold{FOLD}/data_insilico_w \
+        python kaggle_run_increment1.py --seed 42 --out_subdir arm{arm}_fold{FOLD} --noc_arm {arm}
 ```
 
 Đổi `fold1` ở **cả 2 chỗ**. Không cần `STR_FOLD` trên Kaggle — fold đã đóng băng trong dataset.

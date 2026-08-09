@@ -76,9 +76,10 @@ def stage_prep_data_w():
     run([PY, "features/enrich.py", str(DATA_W)])   # build tokens8_{train,val,test,open,dev}.npy
 
 
-def stage_train(seed, out_subdir):
+def stage_train(seed, out_subdir, noc_arm=0):
     env = os.environ.copy(); env["STR_DATA_DIR"] = str(DATA_W)
-    run([PY, "train_set_transformer.py", "--seed", str(seed), "--out_subdir", out_subdir], env=env, cwd=HERE)
+    run([PY, "train_set_transformer.py", "--seed", str(seed), "--out_subdir", out_subdir,
+         "--noc_arm", str(noc_arm)], env=env, cwd=HERE)
 
 
 if __name__ == "__main__":
@@ -89,11 +90,13 @@ if __name__ == "__main__":
     ap.add_argument("--out_subdir", type=str, default="inc22_fixed_aslot")
     ap.add_argument("--skip-prep", action="store_true",
                     help="reuse an existing data_w_inc22/ (skip copy/dev-split/enrich)")
+    ap.add_argument("--noc_arm", type=int, default=0, choices=(0, 1, 2, 3),
+                    help="0 baseline | 1 +SmoothL1(sum gate,NOC) | 2 -logits_card -postRF | 3 -CORN")
     args = ap.parse_args()
 
     if args.from_raw:
         stage_raw_to_insilico()
     if not args.skip_prep:
         stage_prep_data_w()
-    stage_train(args.seed, args.out_subdir)
+    stage_train(args.seed, args.out_subdir, args.noc_arm)
     print("\nDONE.")
