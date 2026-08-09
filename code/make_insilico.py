@@ -354,7 +354,15 @@ def gen_mixture_peak_labeled(donor_cols, rng, bin_size, mode="realistic"):
     var_bin = mu2_bin * PH_CV**2
     return xflat, y, k, beta, attr_bin, phi45, mu_bin.astype(np.float32), var_bin.astype(np.float32), dropin_bin
 
-PEAK_MODEL = int(os.environ.get("STR_PEAK_MODEL", "1"))   # 1 = EuroForMix-style peak model (default), 0 = legacy overlay
+# 0 = overlay real NOC1 profiles (DEFAULT), 1 = EuroForMix-style peak model.
+# Overlay by measurement, per-NOC against real test — the peak model is too clean on every axis:
+#   peaks no donor explains  real .17-.22 | peak .036-.040 | overlay .19-.24
+#   n_peaks                  real 119-142 | peak  92-125   | overlay 133-160
+#   MAC                      real  11-12  | peak   7-9     | overlay  12-14
+#   max/median peak          real  12-18  | peak  91-113   | overlay  17-20
+# Fold 0 with the peak model: oracle .9272, post-hoc .6788, count .7029. With overlay: .9636 / .9126 /
+# .9258. This default has silently flipped to 1 once and cost a full fold — do not change it casually.
+PEAK_MODEL = int(os.environ.get("STR_PEAK_MODEL", "0"))
 def gen_any(cols, pool, rng, bin_size, mode=None):
     """Dispatch: peak model (direct from genotype, reproduces faint tail) or legacy overlay."""
     if PEAK_MODEL and DONOR_DOSAGE is not None:

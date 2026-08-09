@@ -1345,8 +1345,7 @@
   "split_sizes": {
     "train": 5247,
     "val": 1124,
-    "test": 2198,
-    "monitor": 260,
+    "test": 2458,
     "open": 1366
   },
   "combo_list": [
@@ -1461,12 +1460,16 @@
     ]
   ],
   "split_policy": {
-    "description": "Single-source (NOC=1): stratified by donor (all 45 donors in every split). Multi-person (NOC>=2): 1 combo per NOC -> MONITOR (real-domain checkpoint selection, never reported), the rest -> TEST. The network trains on in-silico mixtures only; every real combo (monitor + test) is excluded from in-silico generation. The post-hoc decode is fit leave-one-combo-out via combo_id_test.npy. val is single-source only.",
+    "description": "Single-source (NOC=1): stratified by donor (all 45 donors in every split). Multi-person (NOC>=2): EVERY closed donor-combo goes to test \u2014 the network trains on in-silico mixtures only, so no real combo is spent on train/val, and all of them are excluded from in-silico generation. The post-hoc decode is fit leave-one-combo-out via combo_id_test.npy. val is single-source only.",
     "multi_person_combos": {
       "train": {},
       "val": {},
       "test": {
         "NOC2": [
+          [
+            31,
+            32
+          ],
           [
             33,
             34
@@ -1506,6 +1509,11 @@
             46
           ],
           [
+            46,
+            47,
+            48
+          ],
+          [
             47,
             48,
             49
@@ -1523,6 +1531,12 @@
             34,
             35,
             36
+          ],
+          [
+            36,
+            37,
+            38,
+            39
           ],
           [
             44,
@@ -1547,6 +1561,13 @@
             35
           ],
           [
+            33,
+            34,
+            35,
+            36,
+            37
+          ],
+          [
             35,
             36,
             37,
@@ -1559,38 +1580,6 @@
             45,
             46,
             47
-          ]
-        ]
-      },
-      "monitor": {
-        "NOC2": [
-          [
-            31,
-            32
-          ]
-        ],
-        "NOC3": [
-          [
-            46,
-            47,
-            48
-          ]
-        ],
-        "NOC4": [
-          [
-            36,
-            37,
-            38,
-            39
-          ]
-        ],
-        "NOC5": [
-          [
-            33,
-            34,
-            35,
-            36,
-            37
           ]
         ]
       }
