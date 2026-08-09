@@ -117,6 +117,7 @@ code/
   prepare_data_set.py
   preprocess.py
   train_set_transformer.py
+  train_noc_head.py
   phi_rerank.py
   make_dev_split.py
   make_insilico.py

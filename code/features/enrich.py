@@ -25,31 +25,6 @@ import numpy as np
 N_FIELDS = 9
 
 
-def add_size_fields(en9: np.ndarray, mask: np.ndarray, size: np.ndarray) -> np.ndarray:
-    """Append the DEGRADATION representation (Increment 2a, needs per-peak size(bp) from
-    extract_size.py / make_insilico size table) -> 11 fields:
-      9  size_bp      raw fragment size (bp)                         sufficient statistic (§8)
-      10 degr_resid   log_h - (a + b*size) per-sample linear fit     degradation-corrected height
-                      (STRmix degradation model: height decays with fragment size; the residual
-                      isolates true contributor tier from the degradation trend). 0 if <3 peaks.
-    """
-    N, S, _ = en9.shape
-    out = np.zeros((N, S, 11), np.float32)
-    out[:, :, :9] = en9
-    out[:, :, 9] = np.where(mask, size, 0.0)
-    log_h = en9[:, :, 2]
-    for i in range(N):
-        v = mask[i] & (size[i] > 0)
-        if v.sum() < 3:
-            continue
-        x = size[i, v].astype(np.float64); yy = log_h[i, v].astype(np.float64)
-        if x.std() < 1e-6:
-            continue
-        b, a = np.polyfit(x, yy, 1)
-        out[i, v, 10] = (yy - (a + b * x)).astype(np.float32)
-    return out
-
-
 def enrich_tokens(tokens: np.ndarray, mask: np.ndarray) -> np.ndarray:
     tokens = tokens.astype(np.float32)
     N, S, _ = tokens.shape
@@ -130,17 +105,12 @@ if __name__ == "__main__":
             print(f"  {sp}: enrich-after-feas keeps {kept:.3f} of peaks for feature computation")
         else:
             en = enrich_tokens(tok, mk)                      # (N, S, 9)
-        np.save(D / f"tokens9_{sp}.npy", en)
         np.save(D / f"tokens8_{sp}.npy", en[:, :, :8])       # 8-field slice (Increment 1 token)
-        msg = f"{sp}: {en.shape} -> tokens9_{sp}.npy (+ tokens8 slice)"
-        sz_path = D / f"size_{sp}.npy"
-        if sz_path.exists():                                 # Increment 2a: size + degradation -> tokens11
-            en11 = add_size_fields(en, mk.astype(bool), np.load(sz_path))
-            np.save(D / f"tokens11_{sp}.npy", en11)
-            msg += f" (+ tokens11 size/degradation)"
-        print(msg)
+        print(f"{sp}: {en.shape} -> tokens8_{sp}.npy")
+        if sp == "test":
+            en_test = en
     # sanity on test
-    en = np.load(D / "tokens9_test.npy"); mk = np.load(D / "mask_test.npy")
+    en = en_test; mk = np.load(D / "mask_test.npy")
     noc = np.load(D / "noc_test.npy").astype(int)
     v = mk
     print("\nfeature ranges (valid peaks):")
