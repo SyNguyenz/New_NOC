@@ -13,23 +13,24 @@ This is a faithful, verbatim EXTRACTION of the single code path that
     feas_filter = True         (drop 0-carrier peaks before the encoder; dedicated reject pool)
     n_slot_iters=3, ot_eps=0.05, ot_iters=5
 
-The COUNT (NOC) is post-hoc RandomForest on the prob profile (posthoc_cardinality), NOT the learned
-CORN head: the CORN/noc_head_v2 head was EXCLUDED because it collapses N3/N4 (measured ~0.21/0.17).
-Dropping it does not change the ranking (logits_cls) — CORN read only DETACHED features, so it never
-fed the encoder/decoder.
+The COUNT (NOC) that is DECODED is the post-hoc RandomForest on the prob profile
+(posthoc_cardinality) — the CORN/noc_head_v2 output is never decoded (it collapses N3/N4,
+measured ~0.21/0.17). The CORN head itself IS present and trained (`noc_head_v2=True`), because
+the published arm trained with it: its inputs are detached so it cannot change the ranking, but
+its gradient DOES enter the global clip_grad_norm_ denominator, so removing it silently enlarges
+every other parameter's effective step.
 
 Everything the inc22 path NEVER touches was removed (per_donor/additive/dsmil/sos/spen
 decoders, geno_query, ref_match, em_phi_feature, noise_gate, soft_geno_attr, sparse_attn,
 vib, mass_pool, vicreg, donor_recon, query_denoise, noc_contrast/noc_ord, sic, the unused
-`cardinality_head`, the CORN `ord_count_head`/slot-mass/MAC, the `hybrid`/`pooled` heads, the
-decoder_source raw/local branches, …).
+`cardinality_head`, the `hybrid`/`pooled` heads, the decoder_source raw/local branches, …).
 
 BIT-IDENTICAL guarantee (verify_inc22.py): the parameter NAMES and the forward computation of the
 RANKING heads (logits_cls / logits_card / logits_attr / phi / logit_reject) match the original
 `SetTransformerMixture` for the inc22 config, so the published checkpoint
 results/inc22_fixed_aslot_seed42/best_model.pt loads (strict=False — the checkpoint's extra keys are
-the unused `cardinality_head.*` and the excluded `ord_count_head.*`) and produces byte-identical
-ranking outputs/loss/grad.
+only the unused `cardinality_head.*`) and produces byte-identical outputs/loss/grad — including
+`logits_count_v2` and the `slot_mass` it reads.
 
 Classes/functions copied verbatim from models/set_transformer.py:
   PeriodicNumEmbedding, SetNorm, MABpp, SigmoidMABpp, ISABpp, PMA, sinkhorn_log,
@@ -296,6 +297,18 @@ class AdaptiveSlotDecoder(nn.Module):
             slots = self.gru(updates.reshape(B * K, d), slots.reshape(B * K, d)).reshape(B, K, d)
             slots = slots + self.slot_ffn(self.slot_norm2(slots))
 
+        # Mass-preserving count signal (Fischer & Gärtner 2024, arXiv 2407.04170; GIN/DeepSets): the MESH
+        # row-normalization (weighted mean) ERASES per-slot assignment mass, which a multiset counter
+        # provably needs (sum is injective on multisets; mean/max are not). Recover it as the expected
+        # #peaks assigned to each slot = column-softmax over slots, summed over peaks. Detached (read by
+        # the CORN count head only; never perturbs the slots).  [verbatim: original decoder]
+        with torch.no_grad():
+            aff_f = (self.q_proj(self.slot_norm1(slots)) @ K_h.transpose(1, 2)) / self.scale  # (B,K,N)
+            aff_f = aff_f.masked_fill(pad_mask.unsqueeze(1), -1e9)
+            p2s = torch.softmax(aff_f, dim=1)                          # peak->slot over K slots
+            pw = (~pad_mask).unsqueeze(1).to(p2s.dtype)
+            slot_mass = (p2s * pw).sum(-1)                             # (B, K)
+
         # 4. AdaSlot: separate gate_head, concrete Bernoulli (Logistic noise = diff of two Gumbels)
         gate_logit = self.gate_head(slots).squeeze(-1)                 # (B, K)
         if self.training:
@@ -315,6 +328,7 @@ class AdaptiveSlotDecoder(nn.Module):
             "logits_card": logits_card,
             "gate":        gate,
             "gate_logit":  gate_logit,
+            "slot_mass":   slot_mass,          # (B,K) detached; CORN count-head input only
             "attn":        A,
         }
 
@@ -334,7 +348,7 @@ class SetTransformerMixture(nn.Module):
                  n_token_feats: int = 8, n_freq: int = 8, d_num_emb: int = 8, periodic_sigma: float = 0.3,
                  n_slot_iters: int = 3, ot_eps: float = 0.05, ot_iters: int = 5, gumbel_temp: float = 1.0,
                  donor_geno: torch.Tensor | None = None, donor_geno_mask: torch.Tensor | None = None,
-                 owner_lut: torch.Tensor | None = None):
+                 owner_lut: torch.Tensor | None = None, noc_head_v2: bool = True):
         super().__init__()
         assert donor_geno is not None, "aslot needs donor_geno for CoSA slot init"
         assert owner_lut is not None, "inc22 (set_of_set/feas_filter) needs owner_lut"
@@ -378,6 +392,20 @@ class SetTransformerMixture(nn.Module):
         # privileged aux heads (in-silico only): per-peak attribution + phi abundance
         self.attr_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes + 1))
         self.phi_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes))
+
+        # noc_head_v2 (the published inc22 arm's --noc_head_v2): CORN ordinal count head on a
+        # multiset-COUNT input = sorted prob profile + MAC physical features + mass-preserving
+        # slot_mass. ALL INPUTS DETACHED — it never perturbs the ranking, and decode never reads it.
+        # It is kept because the published run TRAINED with it: its gradient enters the global
+        # clip_grad_norm_ denominator (measured |g_corn| ~ |g_rest|, 90% of steps clipped), so dropping
+        # it silently enlarges every other parameter's effective step.
+        self.noc_head_v2 = noc_head_v2
+        self._ocv2_topm = 8
+        if noc_head_v2:
+            _ocin = (self._ocv2_topm + 2) + 19 + self._ocv2_topm      # prob(10) + MAC(19) + mass(8)
+            self.ord_count_head = nn.Sequential(
+                nn.Linear(_ocin, 64), nn.ReLU(inplace=True),
+                nn.Dropout(dropout), nn.Linear(64, 4))
 
     # ── token projection (with feas_filter) ──────────────────────────────────
     def _project_tokens(self, tokens, mask, apply_feas: bool = True):
@@ -444,6 +472,45 @@ class SetTransformerMixture(nn.Module):
             Hu = isab(Hu, pad_mask=pad_u)
         return self.pma_reject(Hu.detach(), pad_mask=pad_u).squeeze(1)
 
+    def _mac_feats_torch(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """MAC/physical count features (PACE, Marciano & Adelman 2017; deepNoC 2024): per-locus allele
+        counts at several RFU thresholds + global height stats. Fixed input feature (no grad). (B,19).
+        [verbatim: original SetTransformerMixture._mac_feats_torch]"""
+        with torch.no_grad():
+            h = torch.expm1(tokens[:, :, 2])                           # (B,N) RFU
+            loc = tokens[:, :, 0].long().clamp(0, self.n_loci - 1)
+            mb = mask.bool(); B = tokens.size(0); feats = []
+            for T in (0.0, 50.0, 150.0, 500.0):
+                v = (mb & (h > T)).to(h.dtype)
+                cnt = torch.zeros(B, self.n_loci, device=tokens.device).scatter_add_(1, loc, v)
+                feats += [cnt.amax(1, keepdim=True),
+                          (cnt >= 2).sum(1, keepdim=True).to(h.dtype),
+                          (cnt >= 3).sum(1, keepdim=True).to(h.dtype),
+                          v.sum(1, keepdim=True)]
+            mf = mb.to(h.dtype); denom = mf.sum(1, keepdim=True).clamp(min=1)
+            lg = torch.log1p(h.clamp(min=0)) * mf
+            lmean = lg.sum(1, keepdim=True) / denom
+            lvar = (((lg - lmean) ** 2) * mf).sum(1, keepdim=True) / denom
+            feats += [lmean, torch.sqrt(lvar + 1e-6), lg.amax(1, keepdim=True)]
+            return torch.cat(feats, dim=1)                             # (B, 19)
+
+    def _ord_count_logits(self, logits_cls: torch.Tensor, tokens: torch.Tensor,
+                          mask: torch.Tensor, slot_mass: torch.Tensor | None = None) -> torch.Tensor:
+        """CORN ordinal logits (B,4 = K-1) over NOC 1..5 from a multiset-COUNT input = sorted prob
+        profile + MAC features + mass-preserving slot_mass. ALL inputs DETACHED (the count head does
+        not perturb the ranking/slots).  [verbatim: original _ord_count_logits, em_phi_feature off]"""
+        m = self._ocv2_topm
+        probs = torch.sigmoid(logits_cls).detach()
+        s = torch.sort(probs, dim=1, descending=True).values[:, :m]
+        pp = torch.cat([s, probs.sum(1, keepdim=True),
+                        (probs >= 0.5).to(probs.dtype).sum(1, keepdim=True)], dim=1)   # (B, m+2)
+        mac = self._mac_feats_torch(tokens, mask)                                      # (B, 19)
+        if slot_mass is not None:
+            sm = torch.sort(slot_mass.detach(), dim=1, descending=True).values[:, :m]   # (B, m)
+        else:
+            sm = probs.new_zeros(probs.size(0), m)
+        return self.ord_count_head(torch.cat([pp, mac, sm], dim=1))                    # (B, 4)
+
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> dict[str, torch.Tensor]:
         """inc22 forward = the _forward_aslot path of SetTransformerMixture (CORN/noc_head_v2 excluded)."""
         x0, H, pad_mask = self._encode_set(tokens, mask)
@@ -458,10 +525,18 @@ class SetTransformerMixture(nn.Module):
         z = self.pma(H, pad_mask=pad_mask).squeeze(1)
         z_rej = self._reject_pool(tokens, mask)                       # feas_filter: unfiltered + detached
 
-        return {
+        out = {
             "logits_cls":   slot_out["logits_cls"],
             "logit_reject": self.reject_head(z_rej),
             "logits_card":  slot_out["logits_card"],
             "logits_attr":  attr_raw,
             "phi":          F.softplus(self.phi_head(z)),
         }
+        if self.noc_head_v2:
+            out["logits_count_v2"] = self._ord_count_logits(
+                slot_out["logits_cls"], tokens, mask, slot_out.get("slot_mass"))
+        # permutation-invariant slot aggregates, surfaced for a count head. Both are detached in the
+        # decoder, so exposing them cannot alter the ID path.
+        out["gate"] = slot_out["gate"]
+        out["slot_mass"] = slot_out["slot_mass"]
+        return out

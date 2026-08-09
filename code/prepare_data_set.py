@@ -245,6 +245,7 @@ def main():
 
     all_combos = sorted({c for cs in combos_by_noc.values() for c in cs})
     combo_to_id = {c: j for j, c in enumerate(all_combos)}
+
     split_policy_combos: dict[str, dict] = {"train": {}, "val": {}, "test": {}}
     for noc_i, combos in sorted(combos_by_noc.items()):
         split_policy_combos["test"][f"NOC{noc_i}"] = [[int(d) for d in c] for c in combos]
@@ -274,6 +275,7 @@ def main():
     idx_test  = np.concatenate([ss_test, np.array(multi_test, dtype=ss_test.dtype)])
 
     # combo grouping for leave-one-combo-out decode fitting (-1 = single-source)
+    noc_true_all = np.array([len(set(sample_donors[sf])) for sf in sample_files], dtype=np.int32)
     combo_id_all = np.full(len(sample_files), -1, dtype=np.int32)
     for i, c in sample_combo.items():
         combo_id_all[i] = combo_to_id[c]
@@ -293,6 +295,11 @@ def main():
         np.save(DATA_DIR / f"y_{split}_set.npy",   labels[ix])
         np.save(DATA_DIR / f"noc_{split}.npy",     nocs[ix])
         np.save(DATA_DIR / f"combo_id_{split}.npy", combo_id_all[ix])
+        # TRUE contributor count, including donors outside the 45-donor panel. `noc_{split}`
+        # is labels.sum(1) and therefore counts KNOWN donors only, so it under-counts the
+        # open split. NOC supervision does not need donor identity, so the open split is
+        # usable training data for a count head — but only with this label.
+        np.save(DATA_DIR / f"noc_true_{split}.npy", noc_true_all[ix])
 
     # Save sample names for audit / metadata scripts
     for split, ix in splits.items():
@@ -321,8 +328,8 @@ def main():
             "description": (
                 "Single-source (NOC=1): stratified by donor (all 45 donors in every split). "
                 "Multi-person (NOC>=2): EVERY closed donor-combo goes to test — the network trains "
-                "on in-silico mixtures only, so no real combo is spent on train/val. All of them are "
-                "excluded from in-silico generation, and the post-hoc decode (phi-rerank alpha + RF "
+                "on in-silico mixtures only, so no real combo is spent on train/val, and all of them "
+                "are excluded from in-silico generation. The post-hoc decode (phi-rerank alpha + RF "
                 "count) is fit leave-one-combo-out via combo_id_test.npy. val is single-source only."
             ),
             "multi_person_combos": split_policy_combos,

@@ -9,19 +9,24 @@ Faithful extraction of the single inc22 code path from train_set_transformer.py:
              + 0.3 * CE(logits_card, EM-optimal-k target, class-weighted)
              + Kendall( soft_attr_label CE  +  L1 phi )         (aux_heads, soft_attr_label)
   * train aug = mask_peaks 0.15 (drop shared peaks only; never a minor's private/single-carrier peak)
-  * selection = macro-over-NOC oracle Recall@k on the in-silico DEV split (else real val)
+  * selection = macro-over-NOC oracle Recall@k on the in-silico DEV split (else real val).
+                No early stopping; best_model.pt = best DEV epoch, last_model.pt = final epoch.
 
 DECODE:
   1. phi_rerank: independent EM mixture-proportion deconvolution -> logarithmic-opinion-pool rerank
      of the per-donor logits (alpha tuned on val).  Reranks the RANKING (which donors) only.
   2. COUNT = post-hoc RandomForest on the PROB profile (posthoc_cardinality, the original inc22 count).
      NOT count-on-rerank: counting on the LOP-reranked score ('lop count') trades N3/N4 down for N5
-     (measured ~-13pp N3, -7pp N4) — rejected.  The learned CORN count head (noc_head_v2) is likewise
-     EXCLUDED (it collapses N3/N4 ~0.21/0.17).
+     (measured ~-13pp N3, -7pp N4) — rejected.  The learned CORN head (noc_head_v2) is TRAINED
+     (it is part of the published arm's optimisation) but its output is NEVER decoded — it
+     collapses N3/N4 ~0.21/0.17.
   3. decode top-k_post of the reranked ranking.  oracle = top-true-k of the reranked ranking (ceiling).
 
 Everything inc22 does NOT use was removed (no replicates / em_phi / noise_gate / ref_match /
-soft_geno_attr / sparse_attn / minor_weight / irm / vicreg / rnc / distill / CORN / the flag zoo).
+soft_geno_attr / sparse_attn / minor_weight / irm / vicreg / rnc / distill / the flag zoo).
+`--noc_head_v2` IS kept: verify_corn_port shows the published checkpoint's ord_count_head loads
+and reproduces logits_count_v2 exactly, and its gradient enters the global clip_grad_norm_
+denominator (|g_corn| ~ |g_rest|, 90% of steps clipped) — dropping it is NOT training-neutral.
 
 Run (STR_DATA_DIR points at the enriched, dev-split data dir; donor_geno.npy must be present there
 or under ./data):
@@ -48,6 +53,7 @@ from sklearn.ensemble import RandomForestClassifier
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from models.set_transformer import SetTransformerMixture
+from models.ordinal import corn_loss
 import phi_rerank as pr
 
 # Data dir (the orchestrator sets STR_DATA_DIR to the enriched, dev-split data_w).
@@ -77,7 +83,7 @@ LUT_W = 1024
 CFG = {
     "n_loci": 24, "d_locus": 16, "d_model": 128, "n_heads": 4, "n_isab": 2, "m_inducing": 32,
     "n_classes": 45, "dropout": 0.1,
-    "lr": 6e-4, "weight_decay": 1e-4, "batch_size": 256, "epochs": 150, "patience": 25,
+    "lr": 6e-4, "weight_decay": 1e-4, "batch_size": 256, "epochs": 150,   # no early stopping
     "alpha_reject": 0.5, "beta_card": 0.3, "card_lambda": 0.02, "open_ratio": 0.25,
     "n_token_feats": 8, "num_embed": "periodic", "periodic_sigma": 0.3, "n_freq": 8, "d_num_emb": 8,
     "encoder": "isab++", "nc_attn": "mab0", "cls_decoder": "aslot",
@@ -88,6 +94,10 @@ CFG = {
     # decode: phi-rerank the RANKING, count = post-hoc RF on the PROB profile (CORN excluded — it
     # collapses N3/N4; count-on-rerank trades N3/N4 for N5).
     "phi_rerank": True, "count_on_probs": True,
+    # --noc_head_v2 of the published arm: CORN ordinal count head on DETACHED features.
+    # Decode NEVER reads it (count stays post-hoc RF). Kept because the published run
+    # TRAINED with it and its gradient enters the global clip_grad_norm_ denominator.
+    "noc_head_v2": True, "noc_v2_weight": None,   # None -> beta_card (0.3), as in the original
 }
 
 
@@ -170,6 +180,11 @@ def posthoc_cardinality(P_val, y_val, P_test, lam=0.02):
         tk[i] = best
     return RandomForestClassifier(n_estimators=300, max_depth=6, random_state=42).fit(
         _card_feats(P_val), tk).predict(_card_feats(P_test))
+
+
+def _pn_(lst):
+    """per-NOC dict from a per_noc_em list (index 0 = overall)."""
+    return {str(j): (None if np.isnan(lst[j]) else round(float(lst[j]), 4)) for j in range(1, 6)}
 
 
 def per_noc_em(y_true, y_pred, noc):
@@ -322,6 +337,7 @@ def train(seed: int, out_subdir: str):
         print(f"selection set = in-silico DEV ({len(sel_loader.dataset)} samples)")
     else:
         sel_loader = val_loader; print("selection set = real val (no dev split found)")
+
     open_iter = iter(DataLoader(
         open_ds, sampler=RandomSampler(open_ds, replacement=True,
                                        num_samples=len(train_ds) * cfg["epochs"], generator=gen),
@@ -344,6 +360,7 @@ def train(seed: int, out_subdir: str):
         periodic_sigma=cfg["periodic_sigma"], n_slot_iters=cfg["n_slot_iters"], ot_eps=cfg["ot_eps"],
         ot_iters=cfg["ot_iters"], gumbel_temp=cfg["gumbel_temp"],
         donor_geno=donor_geno, donor_geno_mask=donor_geno_mask, owner_lut=owner_lut,
+        noc_head_v2=cfg["noc_head_v2"],
     ).to(DEVICE)
     # per-feature standardization from train valid peaks (enriched tokens)
     _tk = train_ds.tokens.numpy(); _mk = train_ds.mask.numpy().astype(bool)
@@ -356,6 +373,7 @@ def train(seed: int, out_subdir: str):
     bce_cls = AsymmetricLoss(gamma_neg=cfg["asl_gamma_neg"], gamma_pos=cfg["asl_gamma_pos"], clip=cfg["asl_clip"])
     bce_rej = nn.BCEWithLogitsLoss()
     alpha = cfg["alpha_reject"]; beta = cfg["beta_card"]; card_lam = cfg["card_lambda"]
+    noc_v2_w = float(cfg["noc_v2_weight"]) if cfg["noc_v2_weight"] is not None else beta
     _nc = np.bincount(np.clip(np.load(DATA_DIR / "noc_train.npy"), 1, 5) - 1, minlength=5).astype(float)
     _w = 1.0 / np.clip(_nc, 1, None); _w = _w / _w.mean()
     card_w = torch.tensor(np.clip(_w, 0.5, 2.0), dtype=torch.float32).to(DEVICE)
@@ -375,9 +393,9 @@ def train(seed: int, out_subdir: str):
         ab = (torch.round(tok[:, :, 1] * 10).long() + ALLELE_OFF).clamp(0, owner_lut.size(1) - 1)
         return owner_lut[loc, ab]
 
-    best_sel, best_epoch, patience_count = 0.0, 0, 0
-    patience = cfg["patience"]; epochs = cfg["epochs"]; history = []
-    print(f"\nTraining up to {epochs} epochs (patience={patience}) ...")
+    best_sel, best_epoch = 0.0, 0
+    epochs = cfg["epochs"]; history = []
+    print(f"\nTraining {epochs} epochs (no early stopping) ...")
     t0 = time.time()
 
     for epoch in range(1, epochs + 1):
@@ -421,6 +439,12 @@ def train(seed: int, out_subdir: str):
 
             loss = loss_cls + alpha * loss_rej + beta * loss_noc
 
+            # CORN count head on TRUE noc (noc_head_v2). Inputs are detached, so this adds no
+            # encoder gradient — but it DOES add gradient mass to clip_grad_norm_, exactly as in
+            # the published arm. Decode ignores logits_count_v2.
+            if cfg["noc_head_v2"] and "logits_count_v2" in out:
+                loss = loss + noc_v2_w * corn_loss(out["logits_count_v2"], noc.clamp(1, 5), 5)
+
             # privileged aux: soft_attr_label CE (EuroForMix phi*CN soft labels) + L1 phi, Kendall-weighted
             loss_attr_v = loss_phi_v = 0.0
             if (attr >= 0).any():
@@ -457,23 +481,23 @@ def train(seed: int, out_subdir: str):
         n = len(train_ds); epoch_loss /= n
         val_f1 = evaluate_closed(model, val_loader)
         val_em, val_macrec = evaluate_oracle_em(model, sel_loader)
-        scheduler.step(val_macrec)
+        sel_score = val_macrec
+        scheduler.step(sel_score)
         history.append({"epoch": epoch, "loss": round(epoch_loss, 4), "val_macro_f1": round(val_f1, 4),
                         "val_oracle_em": round(val_em, 4), "val_macro_recall": round(val_macrec, 4)})
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Ep {epoch:3d} | loss={epoch_loss:.4f} (cls={epoch_cls/n:.3f} rej={epoch_rej/n:.3f} "
                   f"noc={epoch_noc_l/n:.3f} attr={epoch_attr/n:.3f} phi={epoch_phi/n:.3f}) "
-                  f"| val_macrec={val_macrec:.4f} val_em={val_em:.4f} val_f1={val_f1:.4f} "
-                  f"| lr={optimizer.param_groups[0]['lr']:.1e}")
+                  f"| DEV macrec={val_macrec:.4f} em={val_em:.4f} f1={val_f1:.4f} "
+                  + f"| lr={optimizer.param_groups[0]['lr']:.1e}")
 
-        if val_macrec > best_sel:
-            best_sel, best_epoch, patience_count = val_macrec, epoch, 0
+        # NO early stopping: the selection metric saturates and a patience counter stops on noise.
+        # Always run the full `epochs`. `best_model.pt` = best in-silico DEV epoch, `last_model.pt` =
+        # final epoch, so both can be evaluated.
+        if sel_score > best_sel:
+            best_sel, best_epoch = sel_score, epoch
             torch.save(model.state_dict(), results_dir / "best_model.pt")
-        else:
-            patience_count += 1
-            if patience_count >= patience:
-                print(f"  Early stop at ep {epoch} (best ep {best_epoch}, val macro-recall={best_sel:.4f})")
-                break
+        torch.save(model.state_dict(), results_dir / "last_model.pt")
     print(f"Training done in {time.time()-t0:.1f}s")
 
     # ── Test eval: phi-rerank -> post-hoc RF count on the reranked score ────────
@@ -553,11 +577,11 @@ def train(seed: int, out_subdir: str):
     np.save(results_dir / "y_test_true.npy", y_te_true)
 
     def _pn(lst):
-        return {str(j): (None if np.isnan(lst[j]) else round(float(lst[j]), 4)) for j in range(1, 6)}
+        return _pn_(lst)
 
     out_dict = {
         "model": "set_transformer", "config": cfg,
-        "best_val_macro_recall": round(best_sel, 4), "best_epoch": best_epoch,
+        "best_selection_score": round(best_sel, 4), "best_epoch": best_epoch,
         "decode": decode_desc,
         "phi_rerank_alpha": float(alpha_pr),
         "phi_rerank_alpha_per_group": alphas,

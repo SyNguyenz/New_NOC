@@ -31,14 +31,44 @@ Fold = cắt permutation seed-42 của `[1..50]` thành 10 khối 5 người; `S
 ## 2. Thiết kế split (để đọc kết quả cho đúng)
 
 - **NOC=1**: stratify theo donor → mọi donor có mặt ở train + val + test.
-- **NOC≥2**: **toàn bộ** combo thật nằm ở `test`; `train` và `val` chỉ có single-source.
+- **NOC≥2**: **toàn bộ** combo thật nằm ở `test`; `train`/`val` chỉ có single-source.
   Network train trên in-silico, mọi combo thật bị loại khỏi sinh in-silico.
 - **Decode**: `alpha` (phi-rerank) và RF count được fit **leave-one-combo-out** — mỗi combo được chấm
   bởi bộ decode fit trên các combo khác + val single-source (`combo_id_test.npy` giữ grouping).
   Đây là **cross-validated estimate**, không phải một held-out set duy nhất.
 
-`metrics.json` ghi: `phi_rerank_alpha` (bản deploy, fit trên toàn bộ mixture),
-`phi_rerank_alpha_per_group`, `n_decode_groups`, `n_test_mixtures`.
+### Generator: overlay, không phải peak model
+
+`make_insilico` có hai đường sinh. Mặc định giờ là **overlay profile NOC1 thật** (`STR_PEAK_MODEL=0`).
+Đo trên real test, khớp per-NOC:
+
+| thống kê | REAL | peak model | **overlay** |
+|---|---:|---:|---:|
+| peak không donor nào giải thích | 0.17–0.22 | 0.036–0.040 | **0.19–0.24** |
+| n_peaks | 119–142 | 92–125 | **133–160** |
+| MAC | 11–12 | 7–9 | **12–14** |
+| max / median peak | 12–18 | 91–113 | **17–20** |
+
+Overlay lệch đều về **phía khó** trên mọi trục. Hệ quả: điểm trên in-silico DEV sẽ **thấp hơn** điểm
+real — đó là ước lượng bi quan, đừng đọc nhầm thành model kém đi.
+
+### Enrich chạy SAU feasibility filter
+
+Các cột enrich (`h/tot` trong locus, rank, `h/gmax`, `n/10`, tỉ lệ stutter) là đại lượng **tương đối
+trong locus**. Tính chúng trên tập peak chưa lọc thì nhiễu 0-carrier bóp méo đặc trưng của peak thật,
+kể cả khi `feas_filter` bỏ peak nhiễu sau đó. Đo trên real test: **+0.048** macro-over-NOC recall,
+không cần train lại. `STR_ENRICH_AFTER_FEAS=0` trả về thứ tự cũ.
+
+### Chọn checkpoint
+
+Selection = macro-over-NOC oracle Recall@k trên **in-silico DEV**, **không** early stopping (metric bão
+hoà sớm nên patience chỉ dừng trên nhiễu). Lưu `best_model.pt` (epoch DEV tốt nhất) và `last_model.pt`.
+
+Từng có một `monitor` split (vài combo thật, chỉ để chọn checkpoint) vì DEV khi đó **đảo dấu** so với
+real. Sau khi sửa generator, khác biệt giữa các epoch co từ 0.238 xuống **<0.01** macro-over-NOC, và
+checkpoint chọn theo DEV còn hơn chọn theo monitor về oracle (0.9700 vs 0.9636) — monitor không còn
+đáng 4 combo, đã gỡ. Đổi lại **mất dụng cụ báo drift**: nếu sau này đổi generator/pipeline thì phải
+dựng lại tín hiệu real trong vòng train trước khi tin số.
 
 ---
 
@@ -66,12 +96,13 @@ Thời gian: đọc CSV + build array ~5 phút, `make_insilico --build 50000` th
 python -c "import json;m=json.load(open('code/data/meta_set.json'));f=json.load(open('code/data/fold_info.json'));mp=m['split_policy']['multi_person_combos'];print('fold',f['fold']);print('unknown',m['unknown_donors']);print('n_classes',m['n_classes']);print('sizes',m['split_sizes']);print('n_test_combos',{k:len(v) for k,v in mp['test'].items()});print('val combos (must be empty)',mp['val'])"
 ```
 
-- `fold`, `unknown`, `n_test_combos` khớp bảng mục 1
+- `fold`, `unknown` khớp bảng mục 1
 - `n_classes` = 45
+- `n_test_combos` khớp cột "combo thật N2/N3/N4/N5" — **toàn bộ** combo của fold nằm ở test
 - `multi_person_combos["val"]` phải là `{}`
 
-Trong log `make_insilico` phải thấy `excluding real combos from in-silico train — test=[...] val=[]`,
-và danh sách `test=` khớp đủ combo của fold đó.
+Trong log `make_insilico` phải thấy `excluding N real combos from in-silico train: [...]`, với **N =
+tổng combo thật** của fold. Không combo thật nào được tái tạo trong in-silico train.
 
 ### 3.2. Đổi tên trước khi chạy fold kế tiếp
 
@@ -192,7 +223,7 @@ print(json.dumps(json.load(open(f'{r}/metrics.json')), indent=2)[:2000])
 
 Kết quả: `metrics.json`, `best_model.pt`, `y_test_pred.npy`, `y_test_true.npy`.
 
-Kiểm tra: `n_decode_groups` = (số combo của fold) + 1, và `decode` chứa `leave-one-combo-out fit`.
+Kiểm tra: `n_decode_groups` = (số combo test) + 1, và `decode` chứa `leave-one-combo-out fit`.
 Nếu thấy `[legacy: no combo_id_test]` → dataset thiếu `combo_id_test.npy`, phải upload lại.
 
 Lưu về local:

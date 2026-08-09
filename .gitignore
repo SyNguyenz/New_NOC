@@ -20,6 +20,7 @@ err*.txt
 *.npz
 
 # Generated / cached data directories
+work/
 cache_insilico/
 cache_real/
 data_cross/
@@ -37,3 +38,6 @@ results/
 data/synth/raw_synth_train.csv
 data/synth/raw_synth_val.csv
 data/meta.json
+
+# Side analyses kept locally, not part of this project's source
+code/NOC_task/

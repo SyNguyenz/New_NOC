@@ -80,15 +80,56 @@ def enrich_tokens(tokens: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def feasible_mask(tokens: np.ndarray, mask: np.ndarray, donor_geno: np.ndarray,
+                  donor_geno_mask: np.ndarray) -> np.ndarray:
+    """Peaks carried by at least ONE panel donor. Same rule the model's feas_filter applies."""
+    carr = set()
+    gm = donor_geno_mask.astype(bool)
+    for c in range(donor_geno.shape[0]):
+        for j in range(donor_geno.shape[1]):
+            if gm[c, j]:
+                carr.add((int(round(float(donor_geno[c, j, 0]))),
+                          int(round(float(donor_geno[c, j, 1]) * 10))))
+    out = np.zeros(mask.shape, bool)
+    m = mask.astype(bool)
+    for i in range(len(tokens)):
+        for p in np.where(m[i])[0]:
+            out[i, p] = (int(round(float(tokens[i, p, 0]))),
+                         int(round(float(tokens[i, p, 1]) * 10))) in carr
+    return out
+
+
 if __name__ == "__main__":
-    import sys
+    import os, sys
     from pathlib import Path
     D = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data_insilico_w")
+    # Enrich AFTER feasibility filtering. The enriched columns are per-locus RELATIVE quantities
+    # (Hb = h/locus-total, rank, glob_rel = h/global-max, n_at_locus, stutter ratios). Computing them
+    # over the unfiltered peak set lets 0-carrier noise distort the features of the REAL peaks, even
+    # though the model's feas_filter drops those peaks later. Measured on real test: filtering the
+    # no-panel peaks BEFORE enrichment is worth +0.048 macro-over-NOC recall on its own. Real data is
+    # 23% no-panel peaks vs 3.5% in-silico, so this also removes a train/test asymmetry.
+    # STR_ENRICH_AFTER_FEAS=0 restores the old order.
+    after_feas = int(os.environ.get("STR_ENRICH_AFTER_FEAS", "1"))
+    dg = dgm = None
+    if after_feas:
+        for cand in (D / "donor_geno.npy", D.parent / "data" / "donor_geno.npy"):
+            if cand.exists():
+                dg = np.load(cand); dgm = np.load(cand.parent / "donor_geno_mask.npy"); break
+        if dg is None:
+            print("WARN: donor_geno not found -> enriching on the UNFILTERED peak set (old order)")
+            after_feas = 0
     for sp in ["train", "val", "test", "open", "dev"]:
         if not (D / f"tokens_{sp}.npy").exists():
             continue
         tok = np.load(D / f"tokens_{sp}.npy"); mk = np.load(D / f"mask_{sp}.npy")
-        en = enrich_tokens(tok, mk)                          # (N, S, 9)
+        if after_feas:
+            fm = feasible_mask(tok, mk, dg, dgm)
+            kept = fm.sum() / max(mk.astype(bool).sum(), 1)
+            en = enrich_tokens(tok, fm)                      # features from the FEASIBLE set only
+            print(f"  {sp}: enrich-after-feas keeps {kept:.3f} of peaks for feature computation")
+        else:
+            en = enrich_tokens(tok, mk)                      # (N, S, 9)
         np.save(D / f"tokens9_{sp}.npy", en)
         np.save(D / f"tokens8_{sp}.npy", en[:, :, :8])       # 8-field slice (Increment 1 token)
         msg = f"{sp}: {en.shape} -> tokens9_{sp}.npy (+ tokens8 slice)"
