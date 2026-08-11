@@ -48,28 +48,28 @@ python inc22_clean/verify_inc22.py
 | token embed | **periodic** PLR (Gorishniy 2022), `sigma=0.3`, 8-field tokens |
 | pre-encoder | **set_of_set** (private/shared split) + **feas_filter** (drop 0-carrier peaks; dedicated reject pool) |
 | decoder | **AdaptiveSlot**: CoSA geno-init → GSANet attr-refine → MESH Sinkhorn-OT loop (`iters=3, eps=0.05, ot_iters=5`) → AdaSlot Gumbel-Sigmoid gate |
-| count | **post-hoc RandomForest** on the prob profile (NOT a learned head — CORN/noc_head_v2 excluded) |
+| count | **tierA_count**: MLP on permutation-invariant aggregates, fit on in-silico + real NOC1 only |
 | aux (train only) | per-peak attribution (`soft_attr_label` = EuroForMix φ·CN soft CE) + φ regression, Kendall-weighted |
 
 ## Training objective
 
-`ASL(γ_neg=4)` on `logits_cls` + `0.5·BCE(reject)` + `0.3·CE(logits_card, EM-optimal-k)`
-+ `Kendall(soft_attr CE + L1 φ)`, with `mask_peaks=0.15` (drop shared peaks only, never a minor's
-private/single-carrier peak). Selection = macro-over-NOC oracle Recall@k on the in-silico **DEV** split.
+`ASL(γ_neg=4)` on `logits_cls` + `0.5·BCE(reject)` + `0.05·SmoothL1(Σgate, NOC)`
++ `0.3·CORN(logits_count_v2, NOC)` + `Kendall(soft_attr CE + L1 φ)`, with `mask_peaks=0.15` on shared
+peaks and `mask_private` on single-carrier peaks. Selection = macro-over-NOC oracle Recall@k on the
+in-silico **DEV** split.
 
 ## Decode
 
 1. **phi-rerank** (`phi_rerank.py`): independent EM mixture-proportion (Mx) deconvolution → logarithmic-
    opinion-pool rerank of the per-donor logits, `alpha` tuned on val. Reranks the **ranking** (which
    donors / decode order) only.
-2. **COUNT = post-hoc RandomForest on the PROB profile** (`posthoc_cardinality`, the original inc22
-   count). **NOT count-on-rerank**: counting on the LOP-reranked score ("lop count") trades N3/N4 down
-   for N5 — measured on inc22's real test, N3 0.917→0.784 (−13pp), N4 0.930→0.860 (−7pp) for N5
-   +8pp. The learned CORN head (noc_head_v2) is likewise **excluded** — it collapses N3/N4 (~0.21/0.17).
+2. **COUNT = `tierA_count`**: MLP on permutation-invariant aggregates (sorted prob profile,
+   Σgate/sorted gate, sorted slot_mass, scale-invariant physical features), fit on in-silico + real
+   NOC1 only — no labelled real mixture. **NOT count-on-rerank**: counting on the LOP-reranked score
+   trades N3/N4 down for N5 (N3 −13pp, N4 −7pp). CORN is trained but never decoded.
 3. decode top-`k_post` of the reranked ranking; `oracle` = top-true-k of the reranked ranking (ceiling).
 
 `metrics.json` reports `per_noc_oracle` (test ceiling, reranked), `per_noc_at_pred_k` (deployed),
-`count_source` (`posthoc_rf` needs labelled real mixtures, `tierA` is synth-fit),
 `dev_per_noc_oracle` (combo-generalization judge), `phi_rerank_alpha`, `count_acc`, `reject_auroc`.
 
 ## Excluded (everything inc22 does not use / what was measured-bad)
@@ -77,10 +77,9 @@ private/single-carrier peak). Selection = macro-over-NOC oracle Recall@k on the 
 replicates, em_phi_feature, noise_gate, ref_match, soft_geno_attr, phi_inject, sparse_attn,
 minor_weight, irm, vicreg, donor_recon, query_denoise, mass_pool, noc_contrast / noc_ord_head, sic,
 the per_donor / additive / dsmil / sos / spen / pooled / hybrid decoders, geno_query, the
-`decoder_source raw/local` branches, the unused `cardinality_head`, and the **CORN count head**
-(`ord_count_head` / noc_head_v2 + its slot-mass/MAC features) — CORN collapses N3/N4, and it fed only
-DETACHED features so dropping it leaves the ranking byte-identical. Count-on-rerank is also excluded
-(trades N3/N4). Count is post-hoc RF on probs.
+`decoder_source raw/local` branches, the unused `cardinality_head`, the `logits_card` CE (its
+EM-optimal-k target fights tier B on the same gate tensor), and the post-hoc RF count. CORN is kept:
+dropping it measurably hurt (EM .9162 vs .9260). Count-on-rerank is excluded (trades N3/N4).
 
 ## Bit-identical proof (`verify_inc22.py`)
 

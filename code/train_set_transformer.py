@@ -6,20 +6,18 @@ Faithful extraction of the single inc22 code path from train_set_transformer.py:
              set_of_set, feas_filter). See models/set_transformer.py.
   * loss   = ASL(gamma_neg=4) on logits_cls
              + 0.5 * BCE(reject, closed-0 / open-1)
-             + 0.3 * CE(logits_card, EM-optimal-k target, class-weighted)
+             + 0.05 * SmoothL1(sum gate, NOC)                   (tier B: live slots ARE the count)
              + Kendall( soft_attr_label CE  +  L1 phi )         (aux_heads, soft_attr_label)
-  * train aug = mask_peaks 0.15 (drop shared peaks only; never a minor's private/single-carrier peak)
+  * train aug = mask_peaks 0.15 shared / mask_private 0.0 single-carrier
   * selection = macro-over-NOC oracle Recall@k on the in-silico DEV split (else real val).
                 No early stopping; best_model.pt = best DEV epoch, last_model.pt = final epoch.
 
 DECODE:
   1. phi_rerank: independent EM mixture-proportion deconvolution -> logarithmic-opinion-pool rerank
      of the per-donor logits (alpha tuned on val).  Reranks the RANKING (which donors) only.
-  2. COUNT = post-hoc RandomForest on the PROB profile (posthoc_cardinality, the original inc22 count).
-     NOT count-on-rerank: counting on the LOP-reranked score ('lop count') trades N3/N4 down for N5
-     (measured ~-13pp N3, -7pp N4) — rejected.  The learned CORN head (noc_head_v2) is TRAINED
-     (it is part of the published arm's optimisation) but its output is NEVER decoded — it
-     collapses N3/N4 ~0.21/0.17.
+  2. COUNT = tierA_count: MLP on permutation-invariant aggregates, fit on in-silico + real NOC1
+     only, so no labelled real mixture is needed.  The CORN head (noc_head_v2) is TRAINED but never
+     decoded; dropping it measurably hurt.
   3. decode top-k_post of the reranked ranking.  oracle = top-true-k of the reranked ranking (ceiling).
 
 Everything inc22 does NOT use was removed (no replicates / em_phi / noise_gate / ref_match /
@@ -48,7 +46,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from sklearn.metrics import f1_score, roc_auc_score
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -87,56 +84,25 @@ CFG = {
     "n_loci": 24, "d_locus": 16, "d_model": 128, "n_heads": 4, "n_isab": 2, "m_inducing": 32,
     "n_classes": 45, "dropout": 0.1,
     "lr": 6e-4, "weight_decay": 1e-4, "batch_size": 256, "epochs": 150,   # no early stopping
-    "alpha_reject": 0.5, "beta_card": 0.3, "card_lambda": 0.02, "open_ratio": 0.25,
+    "alpha_reject": 0.5, "open_ratio": 0.25,
     "n_token_feats": 8, "num_embed": "periodic", "periodic_sigma": 0.3, "n_freq": 8, "d_num_emb": 8,
     "encoder": "isab++", "nc_attn": "mab0", "cls_decoder": "aslot",
     "aux_heads": True, "set_of_set": True, "feas_filter": True, "soft_attr_label": True,
     "mask_peaks": 0.15, "mask_peaks_min": 8,
-    "mask_private": 0.0,       # drop rate for peaks carried by exactly one donor; 0.0 = original arm
+    "mask_private": 0.0,       # drop rate for peaks carried by exactly one donor
     "n_slot_iters": 3, "ot_eps": 0.05, "ot_iters": 5, "gumbel_temp": 1.0,
     "loss": "asl", "asl_gamma_neg": 4.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
-    # decode: phi-rerank the RANKING, count = post-hoc RF on the PROB profile (CORN excluded — it
-    # collapses N3/N4; count-on-rerank trades N3/N4 for N5).
-    "phi_rerank": True, "count_on_probs": True,
-    # --noc_head_v2 of the published arm: CORN ordinal count head on DETACHED features.
-    # Decode NEVER reads it (count stays post-hoc RF). Kept because the published run
-    # TRAINED with it and its gradient enters the global clip_grad_norm_ denominator.
-    "noc_head_v2": True, "noc_v2_weight": None,   # None -> beta_card (0.3), as in the original
-    # tier B — make the AdaSlot gate mean what AdaSlot says it means: the number of live slots IS the
-    # count. Measured on fold 0: corr(sum gate, NOC) flips -0.966 -> +0.976, median sum(gate) lands on
-    # 1/2/3/4/5, round(sum gate) alone gives .838 macro-F1 over real NOC2-5, and the tier-A readout on
-    # that backbone gives .882 (vs .854 on the untrained-gate backbone; N5 .630 -> .820) with ID oracle
-    # unharmed (.9838 -> .9856). gate is NOT detached and feeds logits_cls via gate_logit, so this
-    # reaches the encoder — that is the point, and the ID number above is the guard. Set by --noc_arm.
-    "w_gate": 0.0,             # weight on SmoothL1(sum gate, NOC); 0.0 = the pre-tier-B arm
-    "count_source": "rf",      # "rf" = post-hoc RandomForest (LOCO) | "tierA" = invariant-aggregate MLP
+    "phi_rerank": True,
+    # CORN ordinal count head on DETACHED features. Decode never reads it, but the published run
+    # trained with it and its gradient enters the global clip_grad_norm_ denominator; dropping it
+    # measurably hurt (EM .9162 vs .9260, count error 5.37% vs 3.74%).
+    "noc_head_v2": True, "noc_v2_weight": 0.3,
+    # tier B: the number of live AdaSlot slots IS the count. Fold 0 — corr(sum gate, NOC) flips
+    # -0.966 -> +0.980, median sum(gate) lands on 1/2/3/4/5, and the tier-A readout on that backbone
+    # reaches count .9414 (vs .9361) with ID oracle unharmed. gate is NOT detached and feeds
+    # logits_cls via gate_logit, so this reaches the encoder — that is the point.
+    "w_gate": 0.05,            # weight on SmoothL1(sum gate, NOC)
 }
-
-
-def apply_noc_arm(cfg: dict, arm: int) -> dict:
-    """--noc_arm, cumulative. 0 = untouched baseline; each level adds to the one below it.
-
-      1  + SmoothL1(sum gate, NOC).  Nothing else moves: logits_card, CORN and the post-hoc RF all
-         stay, so this isolates the new loss term.
-      2  + drop the logits_card CE and the post-hoc RF count.  logits_card is trained on EM-OPTIMAL-k
-         while tier B trains the same gate tensor on TRUE NOC — two supervisions, two targets, one
-         tensor. Count moves to the tier-A invariant-aggregate MLP (fit on in-silico + real NOC1 only).
-      3  + drop the CORN head, which is now the third redundant count path.
-    """
-    if not 0 <= arm <= 3:
-        raise ValueError(f"--noc_arm must be 0..3, got {arm}")
-    if arm >= 1:
-        cfg["w_gate"] = 0.05
-    if arm >= 2:
-        # noc_v2_weight defaults to beta_card, which we are about to zero — pin it first so cutting
-        # logits_card does not silently switch CORN off too (that is arm 3's job, not arm 2's).
-        if cfg["noc_v2_weight"] is None:
-            cfg["noc_v2_weight"] = cfg["beta_card"]
-        cfg["beta_card"] = 0.0
-        cfg["count_source"] = "tierA"
-    if arm >= 3:
-        cfg["noc_head_v2"] = False
-    return cfg
 
 
 def tierA_count(model, train_ds, val_ds, test_ds):
@@ -188,51 +154,12 @@ class AsymmetricLoss(nn.Module):
         return -loss.mean()
 
 
-def cardinality_target(probs, y, lam=0.02, n_card=5):
-    """EM-optimal NOC target per sample: argmin_k [set_mismatch(top-k, y) + lam*k] -> {0..n_card-1}."""
-    with torch.no_grad():
-        B, C = probs.shape
-        order = probs.argsort(dim=1, descending=True)
-        rank = torch.empty_like(order)
-        ar = torch.arange(C, device=probs.device).expand(B, C)
-        rank.scatter_(1, order, ar)
-        K = y.sum(1).clamp(min=1)
-        costs = []
-        for k in range(1, n_card + 1):
-            topk = (rank < k).float()
-            miss = (y * (1 - topk)).sum(1) / K
-            extra = ((1 - y) * topk).sum(1) / k
-            costs.append(miss + extra + lam * k)
-        return torch.stack(costs, 1).argmin(1)
-
-
 def topk_decode(probs, k_arr):
     yp = np.zeros_like(probs, dtype=int)
     for i in range(len(probs)):
         k = int(max(1, min(5, round(k_arr[i]))))
         yp[i, np.argsort(probs[i])[::-1][:k]] = 1
     return yp
-
-
-def _card_feats(P):
-    s = np.sort(P, 1)[:, ::-1][:, :8]
-    return np.concatenate([s, P.sum(1, keepdims=True), (P >= 0.5).sum(1, keepdims=True)], 1)
-
-
-def posthoc_cardinality(P_val, y_val, P_test, lam=0.02):
-    """ORIGINAL inc22 count: post-hoc RandomForest on the sorted PROB profile, fit on val with the
-    EM-optimal-k cost target.  Count on PROBS — NOT on the phi-reranked score: counting on the rerank
-    ('lop count') trades N3/N4 down for N5 (measured ~-13pp N3, -7pp N4), which violates 'no trading'."""
-    C = P_val.shape[1]; tk = np.ones(len(P_val), int)
-    for i in range(len(P_val)):
-        K = max(int(y_val[i].sum()), 1); best, bc = 1, 9e9
-        for k in range(1, 6):
-            yp = np.zeros(C); yp[np.argsort(P_val[i])[::-1][:k]] = 1
-            c = (y_val[i] * (1 - yp)).sum() / K + ((1 - y_val[i]) * yp).sum() / k + lam * k
-            if c < bc: bc, best = c, k
-        tk[i] = best
-    return RandomForestClassifier(n_estimators=300, max_depth=6, random_state=42).fit(
-        _card_feats(P_val), tk).predict(_card_feats(P_test))
 
 
 def _pn_(lst):
@@ -245,17 +172,15 @@ def per_noc_em(y_true, y_pred, noc):
     return [e.mean()] + [e[noc == j].mean() if (noc == j).sum() else float("nan") for j in range(1, 6)]
 
 
-def loco_decode(L_te, P_te, y_te, noc_te, PHt, combo_id, P_va, y_va, fit_count=True):
-    """LEAVE-ONE-COMBO-OUT fit of the post-hoc decode stage (phi-rerank alpha + RF count).
+def loco_decode(L_te, y_te, noc_te, PHt, combo_id):
+    """LEAVE-ONE-COMBO-OUT fit of the phi-rerank alpha.
 
-    Every real donor-combo lives in test now (the network trains on in-silico only, so no real combo
-    has to be spent as a fitting set). Each combo is scored by an (alpha, RF) pair fit on the OTHER
-    combos only — group-disjoint exactly like the old held-out val, but every real mixture becomes
-    reportable instead of ~15% of them. The single-source test rows form one extra group, fit on all
-    mixtures. Real val (single-source) is always in the RF fit set: it supplies the k=1 examples.
+    Every real donor-combo lives in test (the network trains on in-silico only), so each combo is
+    scored by an alpha fit on the OTHER combos only — group-disjoint, and every real mixture stays
+    reportable. The single-source test rows form one extra group.
 
-    Returns (rank_te, k_post, alphas_per_group, alpha_full). alpha_full is fit on ALL mixtures — that
-    is the artifact you would ship; the per-group alphas exist only to keep the estimate honest.
+    Returns (rank_te, alphas_per_group, alpha_full). alpha_full is fit on ALL mixtures and is the
+    artifact you would ship; the per-group alphas keep the estimate honest.
     """
     mix = combo_id >= 0
     groups = [np.where(combo_id == c)[0] for c in np.unique(combo_id[mix])]
@@ -265,7 +190,6 @@ def loco_decode(L_te, P_te, y_te, noc_te, PHt, combo_id, P_va, y_va, fit_count=T
     alpha_full = float(pr.tune_alpha(L_te[mix], PHt[mix], y_te[mix], noc_te[mix])) if mix.any() else 0.0
 
     rank_te = np.zeros(L_te.shape, dtype=np.float64)
-    k_post = np.ones(len(L_te), dtype=int)
     alphas = []
     for g in groups:
         held = np.zeros(len(L_te), bool); held[g] = True
@@ -274,10 +198,7 @@ def loco_decode(L_te, P_te, y_te, noc_te, PHt, combo_id, P_va, y_va, fit_count=T
         a = float(pr.tune_alpha(L_te[fit], PHt[fit], y_te[fit], noc_te[fit])) if fit.any() else alpha_full
         alphas.append(a)
         rank_te[g] = pr.rerank_scores(L_te[g], PHt[g], a)
-        if fit_count:                    # arm >= 2 counts from the model instead; alpha still LOCO
-            P_fit = np.concatenate([P_te[fit], P_va]); y_fit = np.concatenate([y_te[fit], y_va])
-            k_post[g] = posthoc_cardinality(P_fit, y_fit, P_te[g])
-    return rank_te, k_post, alphas, alpha_full
+    return rank_te, alphas, alpha_full
 
 
 # ── Datasets ─────────────────────────────────────────────────────────────────
@@ -373,17 +294,15 @@ def build_luts(donor_geno, donor_geno_mask, n_cls):
     return owner, cn
 
 
-def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | None = None):
-    cfg = apply_noc_arm(dict(CFG), noc_arm)
-    cfg["seed"] = seed; cfg["out_subdir"] = out_subdir; cfg["noc_arm"] = noc_arm
+def train(seed: int, out_subdir: str, mask_private: float | None = None):
+    cfg = dict(CFG); cfg["seed"] = seed; cfg["out_subdir"] = out_subdir
     if mask_private is not None:
         cfg["mask_private"] = mask_private
     results_dir = ROOT / "results" / f"{out_subdir}_seed{seed}"
     results_dir.mkdir(parents=True, exist_ok=True)
     gen = set_seed(seed)
     print(f"seed={seed}  data={DATA_DIR}  device={DEVICE}")
-    print(f"noc_arm={noc_arm}  w_gate={cfg['w_gate']}  beta_card={cfg['beta_card']}  "
-          f"noc_head_v2={cfg['noc_head_v2']}  count_source={cfg['count_source']}  "
+    print(f"w_gate={cfg['w_gate']}  noc_head_v2={cfg['noc_head_v2']}  "
           f"mask_peaks={cfg['mask_peaks']}/private={cfg['mask_private']}")
 
     train_ds = ClosedSetDataset("train"); val_ds = ClosedSetDataset("val")
@@ -432,12 +351,8 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
     # ── Loss objects + weights ────────────────────────────────────────────────
     bce_cls = AsymmetricLoss(gamma_neg=cfg["asl_gamma_neg"], gamma_pos=cfg["asl_gamma_pos"], clip=cfg["asl_clip"])
     bce_rej = nn.BCEWithLogitsLoss()
-    alpha = cfg["alpha_reject"]; beta = cfg["beta_card"]; card_lam = cfg["card_lambda"]
-    w_gate = float(cfg["w_gate"])
-    noc_v2_w = float(cfg["noc_v2_weight"]) if cfg["noc_v2_weight"] is not None else beta
-    _nc = np.bincount(np.clip(np.load(DATA_DIR / "noc_train.npy"), 1, 5) - 1, minlength=5).astype(float)
-    _w = 1.0 / np.clip(_nc, 1, None); _w = _w / _w.mean()
-    card_w = torch.tensor(np.clip(_w, 0.5, 2.0), dtype=torch.float32).to(DEVICE)
+    alpha = cfg["alpha_reject"]; w_gate = float(cfg["w_gate"])
+    noc_v2_w = float(cfg["noc_v2_weight"])
     # Kendall homoscedastic-uncertainty weights for the privileged aux losses
     log_var_attr = torch.zeros((), device=DEVICE, requires_grad=True)
     log_var_phi  = torch.zeros((), device=DEVICE, requires_grad=True)
@@ -462,7 +377,7 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
 
     for epoch in range(1, epochs + 1):
         model.train()
-        epoch_loss = epoch_cls = epoch_rej = epoch_noc_l = epoch_attr = epoch_phi = 0.0
+        epoch_loss = epoch_cls = epoch_rej = epoch_attr = epoch_phi = 0.0
         for tokens, mask, y, noc, attr, phi in train_loader:
             tokens, mask = tokens.to(DEVICE), mask.to(DEVICE)
             y, noc = y.to(DEVICE), noc.to(DEVICE); attr = attr.to(DEVICE); phi = phi.to(DEVICE)
@@ -487,11 +402,6 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
 
             out = model(tokens, mask)
             loss_cls = bce_cls(out["logits_cls"], y)
-            if beta > 0:
-                card_tgt = cardinality_target(torch.sigmoid(out["logits_cls"]).detach(), y, card_lam)
-                loss_noc = F.cross_entropy(out["logits_card"], card_tgt, weight=card_w)
-            else:
-                loss_noc = torch.zeros((), device=DEVICE)      # arm >= 2: logits_card is cut
 
             # reject: closed -> 0, open -> 1
             try:
@@ -509,7 +419,7 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
                                      torch.ones(len(o_tok), 1, device=DEVICE)], dim=0)
             loss_rej = bce_rej(all_rej, all_rej_lbl)
 
-            loss = loss_cls + alpha * loss_rej + beta * loss_noc
+            loss = loss_cls + alpha * loss_rej
 
             # CORN count head on TRUE noc (noc_head_v2). Inputs are detached, so this adds no
             # encoder gradient — but it DOES add gradient mass to clip_grad_norm_, exactly as in
@@ -553,7 +463,7 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
 
             bs = len(tokens)
             epoch_loss += loss.item() * bs; epoch_cls += loss_cls.item() * bs
-            epoch_rej += loss_rej.item() * bs; epoch_noc_l += loss_noc.item() * bs
+            epoch_rej += loss_rej.item() * bs
             epoch_attr += loss_attr_v * bs; epoch_phi += loss_phi_v * bs
 
         n = len(train_ds); epoch_loss /= n
@@ -565,7 +475,7 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
                         "val_oracle_em": round(val_em, 4), "val_macro_recall": round(val_macrec, 4)})
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Ep {epoch:3d} | loss={epoch_loss:.4f} (cls={epoch_cls/n:.3f} rej={epoch_rej/n:.3f} "
-                  f"noc={epoch_noc_l/n:.3f} attr={epoch_attr/n:.3f} phi={epoch_phi/n:.3f}) "
+                  f"attr={epoch_attr/n:.3f} phi={epoch_phi/n:.3f}) "
                   f"| DEV macrec={val_macrec:.4f} em={val_em:.4f} f1={val_f1:.4f} "
                   + f"| lr={optimizer.param_groups[0]['lr']:.1e}")
 
@@ -600,50 +510,38 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
     dg = donor_geno.cpu().numpy(); dgm = donor_geno_mask.cpu().numpy()
     PHt = pr.deconv_phi(test_ds.tokens.numpy(), test_ds.mask.numpy(), dg, dgm)
 
-    # Decode = phi-rerank the RANKING + post-hoc RF count on the PROBS, both fit LEAVE-ONE-COMBO-OUT.
-    # (count-on-rerank trades N3/N4 for N5 -> excluded; count stays on probs.)
-    use_rf = cfg["count_source"] == "rf"
+    # Decode = phi-rerank the RANKING (alpha fit leave-one-combo-out) + tierA_count for k.
     cid_p = DATA_DIR / "combo_id_test.npy"
     if cid_p.exists():
         combo_id = np.load(cid_p).astype(int)
-        rank_te, k_post, alphas, alpha_pr = loco_decode(
-            L_te, P_te, y_te_true, noc_te, PHt, combo_id, P_va, y_va, fit_count=use_rf)
+        rank_te, alphas, alpha_pr = loco_decode(L_te, y_te_true, noc_te, PHt, combo_id)
         n_groups = len(alphas)
-        decode_desc = "phi_rerank(ranking) + posthoc_rf_count(probs), leave-one-combo-out fit"
         print(f"phi_rerank: LOCO over {n_groups} groups, alpha/group={alphas}, shipped alpha={alpha_pr}")
     else:
-        # legacy bundle (real mixtures still sit in val): tune alpha and fit the RF on val
         PHv = pr.deconv_phi(val_ds.tokens.numpy(), val_ds.mask.numpy(), dg, dgm)
         alpha_pr = float(pr.tune_alpha(L_va, PHv, y_va, noc_va)); alphas = [alpha_pr]; n_groups = 1
         rank_te = pr.rerank_scores(L_te, PHt, alpha_pr)
-        k_post = posthoc_cardinality(P_va, y_va, P_te) if use_rf else np.ones(len(L_te), int)
-        decode_desc = "phi_rerank(ranking) + posthoc_rf_count(probs), val-fit [legacy: no combo_id_test]"
         print(f"phi_rerank: val-tuned alpha={alpha_pr} (legacy path — combo_id_test.npy missing)")
+    decode_desc = "phi_rerank(ranking), LOCO alpha + tierA_count(invariant aggregates, synth-fit)"
 
-    # tier B readout: the gate sum, rounded. Always reported — it costs nothing and it is the honest
-    # check on whether the gate actually learned to count in this run.
+    # round(sum gate) is reported as the check on whether the gate learned to count; k comes from tierA.
     k_gate = np.clip(np.rint(S_te), 1, 5).astype(int)
     mix_ = noc_te >= 2
     print(f"  count round(sum gate): acc {float((k_gate == np.clip(noc_te,1,5)).mean()):.4f}  "
           f"acc_mix {float((k_gate[mix_] == noc_te[mix_]).mean()):.4f}  "
           f"macroF1_mix {f1_score(np.clip(noc_te,1,5)[mix_], k_gate[mix_], average='macro', labels=[2,3,4,5], zero_division=0):.4f}  "
           f"corr(sum gate, NOC) {float(np.corrcoef(S_te, noc_te)[0,1]):+.4f}")
-    if not use_rf:
-        k_post = tierA_count(model, train_ds, val_ds, test_ds)
-        decode_desc = "phi_rerank(ranking), LOCO alpha + tierA_count(invariant aggregates, synth-fit)"
+    k_post = tierA_count(model, train_ds, val_ds, test_ds)
 
     y_te_pred = topk_decode(rank_te, k_post)
     em_post = per_noc_em(y_te_true, y_te_pred, noc_te)
     oracle = per_noc_em(y_te_true, topk_decode(rank_te, noc_te), noc_te)
     count_acc = float((np.clip(k_post, 1, 5) == np.clip(noc_te, 1, 5)).mean())
-    # k_post is the post-hoc RF only on arms 0-1; arms 2-3 count with tierA_count. Name the row after
-    # where k actually came from — "post-hoc" used to be unambiguous and no longer is.
-    k_src = "posthoc_rf" if use_rf else "tierA"
 
     print(f"  {'decode':<14}{'overall':>8}{'NOC1':>7}{'NOC2':>7}{'NOC3':>7}{'NOC4':>7}{'NOC5':>7}")
-    for nm, r in (("oracle", oracle), (f"k={k_src}", em_post)):
+    for nm, r in (("oracle", oracle), ("k=tierA", em_post)):
         print(f"  {nm:<14}" + "".join(f"{x:>7.3f}" for x in r))
-    print(f"  count accuracy (k={k_src}): {count_acc:.4f}")
+    print(f"  count accuracy (k=tierA): {count_acc:.4f}")
 
     # DEV per-NOC oracle on the reranked ranking (combo-generalization judge)
     dev_oracle = None
@@ -684,7 +582,6 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | No
         "n_decode_groups": n_groups,
         "n_test_mixtures": int((noc_te >= 2).sum()),
         "em_at_pred_k": round(float(em_post[0]), 4),
-        "count_source": k_src,          # posthoc_rf (needs labelled real mixtures) | tierA (synth-fit)
         "oracle_em": round(float(oracle[0]), 4),
         "count_acc": round(count_acc, 4),
         "count_acc_gate": round(float((k_gate == np.clip(noc_te, 1, 5)).mean()), 4),
@@ -707,10 +604,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Train the clean inc22_fixed_aslot pipeline.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_subdir", type=str, default="inc22_fixed_aslot")
-    ap.add_argument("--noc_arm", type=int, default=int(os.environ.get("STR_NOC_ARM", "0")),
-                    choices=(0, 1, 2, 3), help=apply_noc_arm.__doc__.split("\n")[0])
     ap.add_argument("--mask_private", type=float,
                     default=float(os.environ.get("STR_MASK_PRIVATE", "0.0")),
                     help="drop rate for single-carrier peaks during training (0.0 = original arm)")
     args = ap.parse_args()
-    train(args.seed, args.out_subdir, args.noc_arm, args.mask_private)
+    train(args.seed, args.out_subdir, args.mask_private)

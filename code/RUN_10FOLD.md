@@ -43,19 +43,7 @@ Env flag (mặc định đã đúng, chỉ đổi khi cần):
 | `STR_PEAK_MODEL` | `0` | `0` = overlay profile NOC1 thật, `1` = peak model |
 | `STR_ENRICH_AFTER_FEAS` | `1` | enrich sau feasibility filter |
 | `STR_DEVICE` | auto | ép `cuda` / `mps` / `cpu` |
-| `STR_NOC_ARM` | `0` | tương đương `--noc_arm` |
 | `STR_MASK_PRIVATE` | `0.0` | tương đương `--mask_private`: tỉ lệ bỏ peak chỉ một donor mang, lúc train |
-
-### `--noc_arm`
-
-| arm | thay đổi |
-|---|---|
-| 0 | baseline |
-| 1 | `+ 0.05·SmoothL1(Σgate, NOC)` |
-| 2 | arm 1, bỏ `logits_card` + post-hoc RF; đếm bằng `tierA_count` |
-| 3 | arm 2, bỏ CORN |
-
-Mọi arm ghi thêm `count_acc_gate`, `count_macro_f1_gate_mix`, `corr_sumgate_noc` vào `metrics.json`.
 
 ---
 
@@ -194,16 +182,10 @@ assert m['split_policy']['multi_person_combos']['val'] == {}, 'dataset build b�
 
 ```python
 !INSILICO_W=/kaggle/input/noc-inc22-fold1/data_insilico_w \
-    python kaggle_run_increment1.py --seed 42 --out_subdir inc22_fixed_aslot_fold1 --noc_arm 0
+    python kaggle_run_increment1.py --seed 42 --out_subdir inc22_fixed_aslot_fold1
 ```
 
-Ba arm chạy trên cùng một dataset, chỉ đổi `--noc_arm` và `--out_subdir`:
-
-```python
-for arm in (1, 2, 3):
-    !INSILICO_W=/kaggle/input/noc-inc22-fold{FOLD}/data_insilico_w \
-        python kaggle_run_increment1.py --seed 42 --out_subdir arm{arm}_fold{FOLD} --noc_arm {arm}
-```
+Thêm `--mask_private 0.15` để bỏ cả peak chỉ một donor mang trong lúc train.
 
 Đổi `fold1` ở **cả 2 chỗ**. Không cần `STR_FOLD` trên Kaggle — fold đã đóng băng trong dataset.
 Notebook restart mà `data_w_inc22/` còn thì thêm `--skip-prep`.
