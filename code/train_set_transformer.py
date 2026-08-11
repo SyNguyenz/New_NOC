@@ -624,11 +624,14 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0):
     em_post = per_noc_em(y_te_true, y_te_pred, noc_te)
     oracle = per_noc_em(y_te_true, topk_decode(rank_te, noc_te), noc_te)
     count_acc = float((np.clip(k_post, 1, 5) == np.clip(noc_te, 1, 5)).mean())
+    # k_post is the post-hoc RF only on arms 0-1; arms 2-3 count with tierA_count. Name the row after
+    # where k actually came from — "post-hoc" used to be unambiguous and no longer is.
+    k_src = "posthoc_rf" if use_rf else "tierA"
 
-    print(f"  {'decode':<12}{'overall':>8}{'NOC1':>7}{'NOC2':>7}{'NOC3':>7}{'NOC4':>7}{'NOC5':>7}")
-    for nm, r in (("oracle", oracle), ("post-hoc", em_post)):
-        print(f"  {nm:<12}" + "".join(f"{x:>7.3f}" for x in r))
-    print(f"  post-hoc count accuracy: {count_acc:.4f}")
+    print(f"  {'decode':<14}{'overall':>8}{'NOC1':>7}{'NOC2':>7}{'NOC3':>7}{'NOC4':>7}{'NOC5':>7}")
+    for nm, r in (("oracle", oracle), (f"k={k_src}", em_post)):
+        print(f"  {nm:<14}" + "".join(f"{x:>7.3f}" for x in r))
+    print(f"  count accuracy (k={k_src}): {count_acc:.4f}")
 
     # DEV per-NOC oracle on the reranked ranking (combo-generalization judge)
     dev_oracle = None
@@ -668,7 +671,8 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0):
         "phi_rerank_alpha_per_group": alphas,
         "n_decode_groups": n_groups,
         "n_test_mixtures": int((noc_te >= 2).sum()),
-        "em_post_hoc": round(float(em_post[0]), 4),
+        "em_at_pred_k": round(float(em_post[0]), 4),
+        "count_source": k_src,          # posthoc_rf (needs labelled real mixtures) | tierA (synth-fit)
         "oracle_em": round(float(oracle[0]), 4),
         "count_acc": round(count_acc, 4),
         "count_acc_gate": round(float((k_gate == np.clip(noc_te, 1, 5)).mean()), 4),
@@ -678,7 +682,7 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0):
         "corr_sumgate_noc": round(float(np.corrcoef(S_te, noc_te)[0, 1]), 4),
         "reject_auroc": auroc,
         "per_noc_oracle": _pn(oracle),
-        "per_noc_post_hoc": _pn(em_post),
+        "per_noc_at_pred_k": _pn(em_post),
         "dev_per_noc_oracle": dev_oracle,
         "history": history,
     }

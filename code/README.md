@@ -68,7 +68,8 @@ private/single-carrier peak). Selection = macro-over-NOC oracle Recall@k on the 
    +8pp. The learned CORN head (noc_head_v2) is likewise **excluded** — it collapses N3/N4 (~0.21/0.17).
 3. decode top-`k_post` of the reranked ranking; `oracle` = top-true-k of the reranked ranking (ceiling).
 
-`metrics.json` reports `per_noc_oracle` (test ceiling, reranked), `per_noc_post_hoc` (deployed),
+`metrics.json` reports `per_noc_oracle` (test ceiling, reranked), `per_noc_at_pred_k` (deployed),
+`count_source` (`posthoc_rf` needs labelled real mixtures, `tierA` is synth-fit),
 `dev_per_noc_oracle` (combo-generalization judge), `phi_rerank_alpha`, `count_acc`, `reject_auroc`.
 
 ## Excluded (everything inc22 does not use / what was measured-bad)
