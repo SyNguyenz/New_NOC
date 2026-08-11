@@ -44,6 +44,7 @@ Env flag (mặc định đã đúng, chỉ đổi khi cần):
 | `STR_ENRICH_AFTER_FEAS` | `1` | enrich sau feasibility filter |
 | `STR_DEVICE` | auto | ép `cuda` / `mps` / `cpu` |
 | `STR_NOC_ARM` | `0` | tương đương `--noc_arm` |
+| `STR_MASK_PRIVATE` | `0.0` | tương đương `--mask_private`: tỉ lệ bỏ peak chỉ một donor mang, lúc train |
 
 ### `--noc_arm`
 

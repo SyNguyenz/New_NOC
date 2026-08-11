@@ -200,6 +200,14 @@ REAL_DIRICHLET_ALPHA = 4.0                                  # concentration -> m
 REAL_EQUAL_FRAC = 0.15                                      # fraction of perfectly balanced mixtures (real has these)
 REAL_GAMMA_SHAPE = 6.0                                      # lower shape -> more per-peak variability (real-like)
 WIDE_REAL_FRAC = 0.5                                        # wide mode: fraction drawn from the realistic regime
+# Template spread of the ORIGINAL mode. sigma=0.55 gives p90/p10 = exp(2*1.2816*0.55) = 4.1x, but real
+# test mixtures span 19-34x (NOC2..5: 33.7 / 19.3 / 24.5 / 23.7; NOC1 matches at 60.6 vs 69.7 only
+# because synth NOC1 IS real NOC1). Consequence: real NOC5 has p10 = 7.6k RFU while synth NOC5 has
+# p10 = 16.0k, so the generator barely reaches the low-template band where the model actually fails.
+# sigma = ln(24)/(2*1.2816) = 1.24 reproduces the observed spread. The old 0.55 was never derived from
+# anything measured; a narrow template distribution is the unrealistic choice, since casework DNA
+# quantity varies by orders of magnitude.
+TTOTAL_SIGMA = float(os.environ.get("STR_TTOTAL_SIGMA", "0.55"))
 
 
 def build_ss_pool():
@@ -235,7 +243,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, mode=None):
         r_max = 6.0 + 5.0 * (k - 2)
         w = np.exp(rng.uniform(0, np.log(r_max), k)); phi = w / w.sum()
         if t_total is None:
-            t_total = float(np.exp(rng.normal(np.log(32000), 0.55)))
+            t_total = float(np.exp(rng.normal(np.log(32000), TTOTAL_SIGMA)))
         gshape = GAMMA_SHAPE
     mix = np.zeros(N_FLAT, dtype=np.float64)
     contrib = np.zeros((k, N_FLAT), dtype=np.float64)        # per-donor RFU contribution per bin

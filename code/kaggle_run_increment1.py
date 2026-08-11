@@ -76,10 +76,11 @@ def stage_prep_data_w():
     run([PY, "features/enrich.py", str(DATA_W)])   # build tokens8_{train,val,test,open,dev}.npy
 
 
-def stage_train(seed, out_subdir, noc_arm=0):
+def stage_train(seed, out_subdir, noc_arm=0, mask_private=0.0):
     env = os.environ.copy(); env["STR_DATA_DIR"] = str(DATA_W)
     run([PY, "train_set_transformer.py", "--seed", str(seed), "--out_subdir", out_subdir,
-         "--noc_arm", str(noc_arm)], env=env, cwd=HERE)
+         "--noc_arm", str(noc_arm),
+         "--mask_private", str(mask_private)], env=env, cwd=HERE)
 
 
 if __name__ == "__main__":
@@ -92,11 +93,13 @@ if __name__ == "__main__":
                     help="reuse an existing data_w_inc22/ (skip copy/dev-split/enrich)")
     ap.add_argument("--noc_arm", type=int, default=0, choices=(0, 1, 2, 3),
                     help="0 baseline | 1 +SmoothL1(sum gate,NOC) | 2 -logits_card -postRF | 3 -CORN")
+    ap.add_argument("--mask_private", type=float, default=0.0,
+                    help="drop rate for single-carrier peaks during training (0.0 = original arm)")
     args = ap.parse_args()
 
     if args.from_raw:
         stage_raw_to_insilico()
     if not args.skip_prep:
         stage_prep_data_w()
-    stage_train(args.seed, args.out_subdir, args.noc_arm)
+    stage_train(args.seed, args.out_subdir, args.noc_arm, args.mask_private)
     print("\nDONE.")

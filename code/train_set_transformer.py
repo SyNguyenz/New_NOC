@@ -92,6 +92,7 @@ CFG = {
     "encoder": "isab++", "nc_attn": "mab0", "cls_decoder": "aslot",
     "aux_heads": True, "set_of_set": True, "feas_filter": True, "soft_attr_label": True,
     "mask_peaks": 0.15, "mask_peaks_min": 8,
+    "mask_private": 0.0,       # drop rate for peaks carried by exactly one donor; 0.0 = original arm
     "n_slot_iters": 3, "ot_eps": 0.05, "ot_iters": 5, "gumbel_temp": 1.0,
     "loss": "asl", "asl_gamma_neg": 4.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
     # decode: phi-rerank the RANKING, count = post-hoc RF on the PROB profile (CORN excluded — it
@@ -372,15 +373,18 @@ def build_luts(donor_geno, donor_geno_mask, n_cls):
     return owner, cn
 
 
-def train(seed: int, out_subdir: str, noc_arm: int = 0):
+def train(seed: int, out_subdir: str, noc_arm: int = 0, mask_private: float | None = None):
     cfg = apply_noc_arm(dict(CFG), noc_arm)
     cfg["seed"] = seed; cfg["out_subdir"] = out_subdir; cfg["noc_arm"] = noc_arm
+    if mask_private is not None:
+        cfg["mask_private"] = mask_private
     results_dir = ROOT / "results" / f"{out_subdir}_seed{seed}"
     results_dir.mkdir(parents=True, exist_ok=True)
     gen = set_seed(seed)
     print(f"seed={seed}  data={DATA_DIR}  device={DEVICE}")
     print(f"noc_arm={noc_arm}  w_gate={cfg['w_gate']}  beta_card={cfg['beta_card']}  "
-          f"noc_head_v2={cfg['noc_head_v2']}  count_source={cfg['count_source']}")
+          f"noc_head_v2={cfg['noc_head_v2']}  count_source={cfg['count_source']}  "
+          f"mask_peaks={cfg['mask_peaks']}/private={cfg['mask_private']}")
 
     train_ds = ClosedSetDataset("train"); val_ds = ClosedSetDataset("val")
     test_ds = ClosedSetDataset("test"); open_ds = OpenSetDataset()
@@ -444,6 +448,7 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0):
                                                            patience=5, min_lr=1e-6)
 
     mask_peaks_p = cfg["mask_peaks"]; mask_min = cfg["mask_peaks_min"]
+    mask_private_p = float(cfg["mask_private"])
 
     def gather_owner(tok):
         loc = tok[:, :, 0].long().clamp(0, 23)
@@ -462,13 +467,20 @@ def train(seed: int, out_subdir: str, noc_arm: int = 0):
             tokens, mask = tokens.to(DEVICE), mask.to(DEVICE)
             y, noc = y.to(DEVICE), noc.to(DEVICE); attr = attr.to(DEVICE); phi = phi.to(DEVICE)
 
-            # mask_peaks: drop a fraction of valid SHARED peaks (never a minor's private peak),
-            # keep >= mask_min so NOC stays identifiable.  Train only.
-            if mask_peaks_p > 0.0:
+            # mask_peaks: drop a fraction of valid peaks, keeping >= mask_min so NOC stays
+            # identifiable.  SHARED peaks drop at mask_peaks; PRIVATE peaks (carried by exactly one
+            # donor) drop at mask_private, which is 0 by default = the original arm.
+            #
+            # Why private peaks are worth dropping: a private allele is what identifies a donor, and
+            # the model has never been trained to survive losing one. Measured consequence — a noise
+            # filter at 99.6% precision / 98.3% recall still costs -1.28pp EM because the <0.5% of
+            # true peaks it removes are exactly this kind, while a LABEL-PERFECT filter gains
+            # +1.95pp. The gap is the model's brittleness, not the filter's accuracy.
+            if mask_peaks_p > 0.0 or mask_private_p > 0.0:
                 mb = mask.bool()
-                drop = (torch.rand_like(mb, dtype=torch.float) < mask_peaks_p) & mb
-                n_car = gather_owner(tokens).sum(-1)
-                drop = drop & (n_car != 1)
+                r = torch.rand_like(mb, dtype=torch.float)
+                priv = gather_owner(tokens).sum(-1) == 1
+                drop = mb & torch.where(priv, r < mask_private_p, r < mask_peaks_p)
                 kept = mb & ~drop
                 enough = kept.sum(1, keepdim=True) >= mask_min
                 mask = torch.where(enough, kept, mb).to(mask.dtype)
@@ -697,5 +709,8 @@ if __name__ == "__main__":
     ap.add_argument("--out_subdir", type=str, default="inc22_fixed_aslot")
     ap.add_argument("--noc_arm", type=int, default=int(os.environ.get("STR_NOC_ARM", "0")),
                     choices=(0, 1, 2, 3), help=apply_noc_arm.__doc__.split("\n")[0])
+    ap.add_argument("--mask_private", type=float,
+                    default=float(os.environ.get("STR_MASK_PRIVATE", "0.0")),
+                    help="drop rate for single-carrier peaks during training (0.0 = original arm)")
     args = ap.parse_args()
-    train(args.seed, args.out_subdir, args.noc_arm)
+    train(args.seed, args.out_subdir, args.noc_arm, args.mask_private)
