@@ -41,3 +41,11 @@ data/meta.json
 
 # Side analyses kept locally, not part of this project's source
 code/NOC_task/
+
+# derived cache, rebuilt by noc1_calib()
+code/data/
+
+#data_raw
+data_raw/
+_archive_*/
+kaggle_upload/
