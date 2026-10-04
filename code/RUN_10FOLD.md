@@ -1,15 +1,11 @@
-# Chạy 10-fold unknown-donor cho `inc22_fixed_aslot`
+# Chạy 10-fold unknown-donor
 
-Mỗi donor trong 50 donor PROVEDIt được làm **unknown (hold-out)** đúng một lần.
 Quy trình: **preprocess ở local** (CPU) → **upload dataset lên Kaggle** → **train trên GPU Kaggle**.
-
 Mọi lệnh chạy từ **repo root** (thư mục chứa `code/`).
 
 ---
 
 ## 1. Bảng 10 fold
-
-Fold = cắt permutation seed-42 của `[1..50]` thành 10 khối 5 người; `STR_FOLD` chọn khối.
 
 | fold | unknown donors | combo thật N2/N3/N4/N5 | mẫu mixture (→ test) | open |
 |:---:|---|---|---:|---:|
@@ -24,133 +20,84 @@ Fold = cắt permutation seed-42 của `[1..50]` thành 10 khối 5 người; `S
 | 8 | 1, 3, 13, 15, 49 | 7 / 5 / 7 / 6 | 1661 | 1143 |
 | 9 | 2, 9, 14, 34, 37 | 7 / 6 / 4 / 2 | 1357 | 1543 |
 
-`n_classes` = **45** ở mọi fold (50 − 5).
+`n_classes` = 45 ở mọi fold.
 
----
-
-## 2. Split & flags
-
-- **NOC=1**: stratify theo donor → mọi donor có mặt ở train + val + test.
-- **NOC≥2**: toàn bộ combo thật nằm ở `test`; `train`/`val` chỉ single-source.
-- **Decode**: `alpha` (phi-rerank) + count fit leave-one-combo-out theo `combo_id_test.npy`.
-- **Checkpoint**: chọn theo in-silico DEV, không early stopping → `best_model.pt` + `last_model.pt`.
-
-Env flag (mặc định đã đúng, chỉ đổi khi cần):
+## 2. Env flag
 
 | flag | mặc định | tác dụng |
 |---|---|---|
-| `STR_FOLD` | `0` | chọn khối 5 donor unknown |
-| `STR_PEAK_MODEL` | `0` | `0` = overlay profile NOC1 thật, `1` = peak model |
-| `STR_ENRICH_AFTER_FEAS` | `1` | enrich sau feasibility filter |
+| `STR_FOLD` | `0` | fold cho `code/preprocess.py` (`preprocess.sh` tự đặt) |
 | `STR_DEVICE` | auto | ép `cuda` / `mps` / `cpu` |
-| `STR_MASK_PRIVATE` | `0.0` | tương đương `--mask_private`: tỉ lệ bỏ peak chỉ một donor mang, lúc train |
+| `STR_BATCH` | `256` | batch train; card 4 GB dùng `128` |
+| `STR_EPOCHS` / `STR_LR` | `150` / `6e-4` | số epoch / learning rate |
+| `STR_INIT_FROM` | — | checkpoint để fine-tune |
+| `STR_EVAL_ONLY` | `0` | `1` = chỉ decode + đánh giá checkpoint `STR_INIT_FROM` |
 
 ---
 
-## 3. Preprocess local (từng fold)
+## 3. Preprocess local: `preprocess.sh` (ở repo root)
 
-Cần Python **≥ 3.10** + `numpy`, `pandas`, `scikit-learn`, `openpyxl`. Không cần GPU/torch.
-`code/data_raw/` đã có sẵn trong repo — không phải tạo symlink gì.
-
-```bash
-STR_FOLD=1 python code/preprocess.py
-```
-
-PowerShell:
+Cần Python ≥ 3.10 + `numpy`, `pandas`, `scikit-learn`, `openpyxl`. Không cần GPU/torch.
 
 ```bash
-$env:STR_FOLD=1; python code/preprocess.py
+bash preprocess.sh                  # in hướng dẫn
+bash preprocess.sh 1                # fold 1 -> data/fold1
+bash preprocess.sh 0 2 5            # các fold 0, 2, 5
+bash preprocess.sh 3-6              # fold 3 đến 6
+bash preprocess.sh all              # fold 0 đến 9
+bash preprocess.sh --override 0     # build lại fold 0 dù data/fold0 đã có
 ```
 
-Sinh `code/data/` (real arrays) → `code/data_insilico_w/` (train in-silico + val/test/open thật).
-Thời gian: đọc CSV + build array ~5 phút, `make_insilico --build 50000` thêm 10–30 phút.
+- Fold đã có `data/foldK` thì bỏ qua, trừ khi có `--override`.
+- Kết quả mỗi fold: `data/foldK/` (self-contained, gồm cả `gen_law.npy`, `donor_geno*`, `combo_id_*`, `fold_info.json`).
+- Log: `data/logs/foldK.log`. Thời gian: ~30 phút / fold.
+- `code/data/` và `code/data_insilico_w/` là thư mục làm việc, bị xóa và dựng lại ở mỗi fold.
 
 ### 3.1. Sanity-check
 
 ```bash
-python -c "import json;m=json.load(open('code/data/meta_set.json'));f=json.load(open('code/data/fold_info.json'));mp=m['split_policy']['multi_person_combos'];print('fold',f['fold']);print('unknown',m['unknown_donors']);print('n_classes',m['n_classes']);print('sizes',m['split_sizes']);print('n_test_combos',{k:len(v) for k,v in mp['test'].items()});print('val combos (must be empty)',mp['val'])"
+K=1; python -c "import json;d='data/fold$K';m=json.load(open(d+'/meta_set.json'));f=json.load(open(d+'/fold_info.json'));mp=m['split_policy']['multi_person_combos'];print('fold',f['fold']);print('unknown',m['unknown_donors']);print('n_classes',m['n_classes']);print('sizes',m['split_sizes']);print('n_test_combos',{k:len(v) for k,v in mp['test'].items()});print('val combos (must be empty)',mp['val'])"
 ```
 
-- `fold`, `unknown` khớp bảng mục 1
-- `n_classes` = 45
-- `n_test_combos` khớp cột "combo thật N2/N3/N4/N5" — **toàn bộ** combo của fold nằm ở test
+- `fold`, `unknown` khớp bảng mục 1; `n_classes` = 45
+- `n_test_combos` khớp cột "combo thật N2/N3/N4/N5"
 - `multi_person_combos["val"]` phải là `{}`
-
-Trong log `make_insilico` phải thấy `excluding N real combos from in-silico train: [...]`, với **N =
-tổng combo thật** của fold. Không combo thật nào được tái tạo trong in-silico train.
-
-### 3.2. Đổi tên trước khi chạy fold kế tiếp
-
-`code/data/` và `code/data_insilico_w/` bị ghi đè mỗi lần chạy:
-
-```bash
-mkdir -p code/folds && mv code/data_insilico_w code/folds/fold1_insilico_w
-```
-
-Chỉ cần giữ `*_insilico_w` — nó đã self-contained (bao gồm `donor_geno*`, `combo_id_*`, `fold_info.json`).
+- `data/logs/foldK.log` có dòng `excluding real combos from in-silico train`
 
 ---
 
-## 4. Đóng gói & upload lên Kaggle
+## 4. Upload lên Kaggle
 
-> Bạn tự zip. Phần dưới quy định *nội dung* và *tên* dataset.
+### 4.1. Dataset CODE (một lần cho cả 10 fold)
 
-### 4.1. Dataset CODE (upload 1 lần, dùng cho cả 10 fold)
-
-Zip thư mục `code/`, **bỏ hẳn**: `data/`, `data_raw/`, `data_insilico_w/`, `data_w_inc22/`, `folds/`,
-`results/`, `notebooks/`, mọi `__pycache__/`. Còn lại ~200 KB.
+`kaggle_upload/code/`: thư mục `code/`.
 
 ```
 code/
-  kaggle_run_increment1.py
-  prepare_data_set.py
-  preprocess.py
-  train_set_transformer.py
-  train_noc_head.py
-  phi_rerank.py
-  make_dev_split.py
-  make_insilico.py
-  build_donor_geno.py
-  build_real_attr.py
-  extract_phi_condition.py
-  extract_size.py
-  verify_inc22.py
-  models/__init__.py
-  models/set_transformer.py
-  features/enrich.py
-  synth/extract_genotypes.py
+  kaggle_run_increment1.py  train_set_transformer.py  decode_layer.py  gen_law.py  phi_rerank.py
+  preprocess.py  make_insilico.py
+  build_donor_geno.py  build_real_attr.py  extract_phi_condition.py  extract_size.py
+  calibrate.py  calibrate_*.py
+  models/__init__.py  models/ordinal.py  models/set_transformer.py
+  features/enrich.py  synth/extract_genotypes.py
 ```
 
-`data/` sẽ được script tự tạo khi chạy.
-
-- Title / slug: `noc-inc22-code` → mount tại `/kaggle/input/noc-inc22-code/code/`
-- Sửa code thì tạo **New Version** của chính dataset này (giữ nguyên slug).
+- Slug: `noc-inc22-code` → `/kaggle/input/noc-inc22-code/code/`
+- Sửa code thì tạo **New Version** của dataset này.
 
 ### 4.2. Dataset DATA (một dataset mỗi fold)
 
-Zip `code/folds/foldK_insilico_w/`, đổi tên thư mục gốc trong zip thành `data_insilico_w`:
+`data/foldK/` = nội dung `code/data_insilico_w/` của fold K (~520 MB).
 
-```
-data_insilico_w/
-  tokens_train.npy  mask_train.npy  Xflat_train.npy  y_train_set.npy  noc_train.npy
-  attr_train.npy    phi_train.npy   size_train.npy
-  tokens_val.npy    mask_val.npy    ...  (val + test đầy đủ)
-  tokens_open.npy   mask_open.npy   Xflat_open.npy   size_open.npy
-  combo_id_test.npy combo_id_val.npy
-  meta_set.json     fold_info.json
-  donor_geno.npy    donor_geno_mask.npy
-```
-
-- Title / slug: `noc-inc22-fold0` … `noc-inc22-fold9` → mount tại `/kaggle/input/noc-inc22-fold1/data_insilico_w/`
-- Mỗi dataset ~350 MB.
-
-> Đường dẫn mount thật hiện ở sidebar "Input". Nếu khác, chạy `!ls /kaggle/input/<slug>` rồi sửa biến.
+- Slug: `noc-inc22-fold0` … `noc-inc22-fold9`
+- `INSILICO_W` phải trỏ vào thư mục chứa `meta_set.json`: upload nội dung `foldK` thì là `/kaggle/input/noc-inc22-foldK`;
+  dataset chứa thư mục `foldK` thì là `/kaggle/input/noc-inc22-foldK/foldK`. Kiểm tra bằng `!ls /kaggle/input/<slug>`.
 
 ---
 
 ## 5. Notebook Kaggle (GPU)
 
-Accelerator: **GPU T4 x2 / P100**. Internet: off.
+Accelerator: GPU T4 x2 / P100. Internet: off.
 
 ### Cell 1 — copy code
 
@@ -164,7 +111,7 @@ import os; os.chdir('/kaggle/working')
 
 ```python
 FOLD = 1
-INSILICO = f'/kaggle/input/noc-inc22-fold{FOLD}/data_insilico_w'
+INSILICO = f'/kaggle/input/noc-inc22-fold{FOLD}'          # thư mục chứa meta_set.json
 
 import json, numpy as np
 m = json.load(open(f'{INSILICO}/meta_set.json'))
@@ -181,52 +128,38 @@ assert m['split_policy']['multi_person_combos']['val'] == {}, 'dataset build b�
 ### Cell 3 — train
 
 ```python
-!INSILICO_W=/kaggle/input/noc-inc22-fold1/data_insilico_w \
-    python kaggle_run_increment1.py --seed 42 --out_subdir inc22_fixed_aslot_fold1
+!INSILICO_W={INSILICO} python kaggle_run_increment1.py --seed 42 --out_subdir inc22_fixed_aslot_fold{FOLD}
 ```
 
-Thêm `--mask_private 0.15` để bỏ cả peak chỉ một donor mang trong lúc train.
-
-Đổi `fold1` ở **cả 2 chỗ**. Không cần `STR_FOLD` trên Kaggle — fold đã đóng băng trong dataset.
-Notebook restart mà `data_w_inc22/` còn thì thêm `--skip-prep`.
+- Không cần `STR_FOLD` trên Kaggle.
+- Notebook restart mà `data_w_inc22/` còn thì thêm `--skip-prep`.
+- ~100 s/epoch, 150 epoch ≈ 4–4.5 giờ + vài phút decode.
 
 ### Cell 4 — thu kết quả
 
 ```python
 import json
 r = f'/kaggle/working/results/inc22_fixed_aslot_fold{FOLD}_seed42'
-print(json.dumps(json.load(open(f'{r}/metrics.json')), indent=2)[:2000])
+mt = json.load(open(f'{r}/metrics.json'))
+print('decode :', mt['decode'])
+print('ID     :', mt['macro_id_mix'], mt['per_noc_at_pred_k'])
+print('count  :', mt['macro_count_mix'], mt['per_noc_count'])
 !ls -la {r}
 ```
 
-Kết quả: `metrics.json`, `best_model.pt`, `y_test_pred.npy`, `y_test_true.npy`.
+Kết quả: `metrics.json`, `best_model.pt`, `last_model.pt`, `y_test_pred.npy`, `y_test_true.npy`.
+Chỉ số cuối cùng: `macro_id_mix` / `macro_count_mix` (macro NOC2–5).
 
-Kiểm tra: `n_decode_groups` = (số combo test) + 1, và `decode` chứa `leave-one-combo-out fit`.
-Nếu thấy `[legacy: no combo_id_test]` → dataset thiếu `combo_id_test.npy`, phải upload lại.
-
-Lưu về local:
-
-```
-results_10fold/fold0/  fold1/  …  fold9/
-```
+Lưu về local: `results_10fold/fold0/ … fold9/`.
 
 ---
 
 ## 6. Lưu ý
 
-**Gộp 10 fold.** Số combo mỗi NOC khác nhau giữa các fold → mỗi ô per-NOC phải kèm `n`, đừng lấy
-trung bình trần của 10 con số.
-
-**"Novel combo" mạnh yếu khác nhau theo NOC.** Với 50000 mixture in-silico và `noc_weights=1,1.5,2.5,2`,
-in-silico phủ ~99.9% không gian combo NOC2, ~53% NOC3, ~11% NOC4, ~1.2% NOC5. Claim novel-combo chỉ thực
-sự mạnh ở NOC4/NOC5.
-
-**Chạy trên Mac.** `train_set_transformer.py` tự chọn CUDA → MPS → CPU. Ép thiết bị bằng `STR_DEVICE`:
+- Gộp 10 fold: mỗi ô per-NOC phải kèm `n`, không lấy trung bình trần của 10 con số.
+- `/kaggle/working`: `data_w_inc22/` sau enrich ~1.5–2 GB, xóa trước khi "Save Version".
+- Smoke-test local (CPU/Mac):
 
 ```bash
-STR_DEVICE=cpu STR_DATA_DIR=code/data_w_inc22 python code/train_set_transformer.py --seed 42 --out_subdir smoke
+STR_DEVICE=cpu STR_EPOCHS=1 STR_DATA_DIR=code/data_w_inc22 python code/train_set_transformer.py --seed 42 --out_subdir smoke
 ```
-
-MPS chậm hơn T4 nhiều — chỉ dùng smoke-test.
-
-**Dung lượng `/kaggle/working`.** `data_w_inc22/` sau enrich ~1.5–2 GB. Xóa trước khi "Save Version".
