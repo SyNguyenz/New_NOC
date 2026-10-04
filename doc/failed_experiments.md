@@ -753,3 +753,307 @@ cân bằng nhưng sai nhiều (142 / 148).
 **5. Giải mã phải chọn theo từng arm, không đặt chung.** `expect` giúp LoRA và clone (+0.004…+0.007) nhưng
 **hại `zero_shot`** (0.9014 so với 0.9102 của `argmax`). Posterior của `logits_card` đã sắc nét nên lấy kỳ
 vọng chỉ làm mờ. Nếu ship `zero_shot` thì phải dùng `--count_decode argmax`.
+
+## 24. S2 — mạng đếm riêng `noc_deep`, không phụ thuộc ID (fold 0, local MPS, 2026-10-02)
+
+`code/noc_deep.py` là mạng đếm kiểu deepNoC, 92k tham số:
+- Đọc mọi peak, không qua bộ lọc panel, không dùng genotype hay điểm ID.
+- Đặc trưng mỗi peak là vật lý (allele, chiều cao, thứ hạng, stutter); gộp peak → locus → hồ sơ, cộng 19 đặc trưng MAC.
+- Dạy bằng NOC thật trên 47.494 hồ sơ sinh của `noc-cond50k-fold0`, 20 epoch (4 giây mỗi epoch), chọn epoch theo DEV in-silico.
+
+Giả thuyết đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 10.
+
+| | `noc_deep` | mốc (backbone 50k, fold 0) | kết quả |
+|---|---|---|---|
+| N1: zero-shot argmax | **0.6782** | `logits_card` 0.8025 | **SAI** |
+| N2: + hiệu chỉnh 371 nhãn, strict | **0.6780 ± 0.0074** | `card_cal` 0.8528 | **SAI** |
+| N3: recall NOC5, zero-shot | **0.728** | `logits_card` 0.368 (+0.10 → 0.468) | **ĐÚNG** |
+
+Recall NOC1..5 của `noc_deep` zero-shot: 0.981 / 0.677 / 0.610 / 0.372 / 0.728. Giao thức deepNoC: 0.6884. DEV in-silico chỉ đạt 0.648.
+
+**Đọc kết quả:**
+1. Bộ đếm độc lập với ID **đếm NOC5 tốt gấp đôi** `logits_card` (0.728 so với 0.368), nhưng **kém hẳn ở NOC2–4**. Tổng thể nó thua, giống bộ đếm vật lý HistGB (0.69).
+2. Ngay trên dữ liệu sinh nó cũng chỉ đạt 0.648. Nghi phạm chính là D2: người góp ít trong dữ liệu sinh rất mờ (trung vị 3% ở NOC5), nên nhiều hỗn hợp sinh "NOC5" thực chất trông như 4 người. Với một bộ đếm chỉ nhìn bằng chứng vật lý, đó là **nhãn nhiễu**. `logits_card` né được vấn đề này nhờ nhãn suy từ ID (M1), và cũng chính vì thế mà nó gọi thiếu NOC5 trên dữ liệu thật.
+
+Theo luật đã chốt: **không chỉnh siêu tham số trên fold 0.** Hướng tiếp theo (ghi trước, kiểm trên fold chưa dùng cho `noc_deep`) là sửa dữ liệu (D2) hoặc ghép có điều kiện. Xem `chay_10fold_zeroshot50k.md`, mục 11.
+
+## 25. D2 — chia lại tỉ lệ người góp theo Dirichlet(1), kiểm bằng `noc_deep` (fold 6, local, 2026-10-02)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 11. Bản generator đã sửa nằm ở `work/s2gen/code` (cờ `STR_COND_PHI=mixed`).
+Hai bộ 20k cùng seed, `noc_deep` train như nhau trên mỗi bộ, chấm trên test thật fold 6.
+
+| | base 20k | mixed 20k | giả thuyết |
+|---|---|---|---|
+| zero-shot macro F1 (argmax) | 0.6090 | 0.6110 | W1 (+0.05): **SAI** |
+| recall NOC4 | 0.307 | 0.275 | W2 (+0.15): **SAI** |
+| hiệu chỉnh 371 nhãn, strict | 0.5818 | 0.5774 | |
+
+**Phép thay đổi không trúng đích.** Với 5 người, Dirichlet(1) cho phần của người ít nhất có trung vị khoảng 0.03, tức gần như
+y như cũ (p10 0.009, trung vị 0.030; dữ liệu thật 0.07–0.13). Mọi tiên nghiệm "đối xứng, không thông tin" đều sinh ra người
+góp rất mờ ở NOC5. Muốn có người góp ít giống thật thì phải đưa vào **thông tin về thiết kế thí nghiệm** (tỉ lệ pha mà phòng
+lab dùng). Mạnh chốt **không** chỉnh theo tập test, nên hướng D2 dừng ở đây.
+
+Thêm một dữ kiện: `noc_deep` trên fold 6 với 20k chỉ đạt 0.61, so với 0.68 ở fold 0 với 47k.
+
+## 26. `noc_deep`: các thay đổi phía model, mẫu nhỏ (fold 0 và 6, local, 2026-10-02)
+
+Train trên 6.000 hồ sơ sinh, chọn epoch trên 2.000 hồ sơ DEV, 25 epoch, seed 42, dữ liệu giữ nguyên.
+Script: `work/run_noc_exp.sh`, kết quả ở `work/noc_deep/exp/`.
+Luật: chỉ giữ thay đổi nếu macro F1 zero-shot tăng ở **cả hai** fold.
+
+| bước | thay đổi | zero-shot fold 0 / fold 6 | + hiệu chỉnh 371 nhãn, strict, fold 0 / fold 6 | quyết định |
+|---|---|---|---|---|
+| E0 | gốc (CE, 8 đặc trưng, d = 64, 2 tầng) | 0.585 / 0.576 | 0.572 / 0.526 | |
+| E1 | M-a: loss thứ tự | 0.625 / 0.577 | 0.604 / 0.514 | giữ |
+| E2 | M-b: + đầu phụ peak/locus (trọng số 0.5) | 0.652 / 0.597 | 0.618 / 0.558 | giữ |
+| E3 | M-c: + 6 đặc trưng peak (stutter lùi 2 bước, nửa bước, cờ vị trí stutter, …) | **0.656 / 0.640** | **0.686 / 0.646** | **giữ** |
+| E4 | M-d: d = 128, 3 tầng | 0.676 / 0.608 | 0.694 / 0.651 | **bỏ** (fold 6 tụt; mẫu nhỏ thì mạng lớn dễ học thuộc) |
+
+Cấu hình giữ lại: `--loss ordinal --aux 0.5 --feats rich`. Tổng cộng tăng khoảng 0.07 ở cả hai fold so với E0.
+Nút thắt vẫn là NOC4 (recall 0.30–0.43). Để so sánh: `noc_deep` gốc train trên **toàn bộ** 47k hồ sơ của fold 0 đạt 0.678, cho thấy lượng dữ liệu train ảnh hưởng mạnh.
+
+**Tiếp mục 26 (02/10).**
+
+| bước | thay đổi | zero-shot fold 0 / fold 6 | + hiệu chỉnh 371 nhãn | quyết định |
+|---|---|---|---|---|
+| E5 | M-e: đưa dự đoán số người mỗi locus ngược vào đầu đếm | 0.638 / 0.660 | 0.687 / 0.662 | bỏ (fold 0 tụt) |
+| E3, seed 43 / 44 | lặp lại E3 với seed khác | 0.672 / 0.677 và 0.650 / 0.638 | | đo nhiễu |
+| **E3_ens3** | **M-f: ghép 3 seed của E3** | **0.664 / 0.664** | 0.689 / 0.650 | **giữ** |
+
+**Nhiễu giữa các seed của E3:** fold 0 là 0.656 / 0.672 / 0.650 (sd khoảng 0.011), fold 6 là 0.640 / 0.677 / 0.638 (sd khoảng 0.022).
+Vì vậy các chênh lệch ±0.02 khi so một seed (E4, E5, phần lớn của E3 so với E2) **nằm trong nhiễu**. Từ đây phải so trên
+trung bình nhiều seed, hoặc trên bản ghép.
+
+## 27. M-g: fine-tune chính nhánh `noc_deep` trên 371 nhãn thật, cách của deepNoC (fold 0 và 6, local, 2026-10-02)
+
+Công thức chốt trước: E3 (seed 42), AdamW lr 1e-4, 30 epoch cố định, batch 64, không có validation. Cùng các lần rút và
+cùng các phần chia như mọi lần fit 371 nhãn khác. Lệnh: `code/noc_deep.py ft`.
+
+| | strict fold 0 / fold 6 | giao thức deepNoC fold 0 / fold 6 | lợi thế khi dùng lại tổ hợp |
+|---|---|---|---|
+| chỉ hiệu chỉnh (6 tham số) | 0.686 / 0.646 | 0.676 / 0.683 | ~0 / +0.04 |
+| fine-tune **đầu cuối** | 0.684 / 0.646 | 0.695 / 0.685 | +0.011 / +0.038 |
+| fine-tune **toàn bộ** nhánh | **0.673 / 0.608** | **0.747 / 0.731** | **+0.074 / +0.123** |
+
+Fine-tune toàn bộ nhánh **không giúp ở strict** (còn tụt ở fold 6), nhưng **đẩy mạnh điểm theo giao thức deepNoC**. Tức là
+cả mạng học thuộc tổ hợp donor đã gặp. Đây là bằng chứng trực tiếp rằng cú tăng 40–60% → 90% của deepNoC sau fine-tune
+(họ cũng fine-tune toàn bộ mạng, 2000 epoch, chia xen kẽ) **có thể một phần đến từ việc dùng lại tổ hợp**. Paper của họ
+không đo được điều này, vì họ không có phép chia tách tổ hợp.
+
+## 28. So CÙNG CỠ DỮ LIỆU 12k: `noc_deep` so với đầu đếm của backbone (fold 0, local, 2026-10-02)
+
+Cùng 15.095 hồ sơ train (bộ `noc-sub12k-of50k-fold0` đã cắt DEV, y hệt lần train backbone sub12k), cùng 2.458 hồ sơ test.
+`noc_deep` là cấu hình E3, ghép 3 seed. Các fit 371 nhãn dùng cùng các lần rút, cùng các phần chia; giải mã expect.
+
+| | dính ID | zero-shot | 371 nhãn, strict | 371 nhãn, giao thức deepNoC |
+|---|---|---|---|---|
+| `logits_card` | có | **0.813** (argmax) / 0.749 (expect) | — | — |
+| `card_cal` | có | — | 0.796 | 0.842 |
+| `head_only` (mục 1b) | có | — | **0.903** | 0.902 |
+| `lora_inv` (mục 1b) | có | — | 0.865 | 0.904 |
+| **`noc_deep`** | **không** | 0.662 (argmax) / 0.653 (expect) | 0.687 (hiệu chỉnh) | 0.696 |
+| `noc_deep`, fine-tune đầu cuối | không | — | 0.682 | 0.698 |
+| `noc_deep`, fine-tune toàn bộ | không | — | 0.702 | **0.775** (lợi thế dùng lại tổ hợp +0.073) |
+| ghép `card_cal` + `noc_deep` | một phần | — | 0.816 | 0.892 |
+
+**Kết luận, cùng cỡ dữ liệu:** `noc_deep` vẫn kém đầu đếm dính ID khoảng **0.15** ở zero-shot, và 0.10–0.21 khi có 371
+nhãn. Khoảng cách này **không phải do cỡ dữ liệu**. Ghép vào thì giúp `card_cal` thêm 0.02 (recall NOC5 tăng từ 0.62
+lên 0.77), nhưng vẫn kém `head_only`.
+
+**H3 đúng như đã ghi trước** (backbone 50k + `noc_deep` 20k): fold 0 ghép đạt 0.761 so với `card_cal` 0.853, fold 6 đạt
+0.891 so với 0.909. **SAI** ở cả hai fold.
+
+**Đường cong `noc_deep` theo cỡ dữ liệu** (zero-shot, ghép 3 seed, fold 0): 6k 0.664 → 12k 0.662 → 20k 0.700.
+
+## 29. M-h: slot đếm chung (tổng cổng) trong `noc_deep`, cùng cỡ dữ liệu (fold 0 và 6, local, 2026-10-02)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 13.
+- Mọi bản dùng **15.095 hồ sơ train**: fold 0 là bộ 12k của backbone sub12k; fold 6 là mẫu rút, cùng các hồ sơ cho mọi bản ở cùng seed.
+- Ghép 3 seed; giải mã argmax. Script: `work/run_match.sh`.
+
+| | zero-shot fold 0 / fold 6 | + hiệu chỉnh 371 nhãn, strict | giao thức deepNoC |
+|---|---|---|---|
+| E3 | 0.680 / 0.684 | 0.685 / 0.686 | 0.699 / 0.730 |
+| **M-h** (+ 6 slot chung, NoC = tổng cổng) | 0.685 / 0.689 | 0.697 / 0.695 | 0.708 / 0.739 |
+| *`logits_card` của backbone 12k (fold 0)* | *0.813* | *`card_cal` 0.796* | |
+
+- **S1 (zero-shot +0.03 ở cả hai fold): SAI.** Chỉ tăng +0.005 ở mỗi fold, nằm trong nhiễu.
+- **S2 (tương quan tổng cổng với NOC thật ≥ 0.90): ĐÚNG**, đạt 0.950 / 0.948.
+  - Tổng cổng **đơn điệu** theo NoC. Trung vị NOC1..5 ở fold 0 là 1.01 / 2.36 / 3.50 / 4.45 / 4.68, khác hẳn `sum(gate)` của backbone (NOC2 > NOC3).
+  - Nhưng NOC4 và NOC5 vẫn bị **dồn sát nhau** (4.45 so với 4.68).
+
+**Nhiễu ở mức bản ghép:** E3 fold 0 chạy lại với thứ tự xáo khác (chỉ do thêm một lần rút ngẫu nhiên) cho 0.680, so với
+0.662 ở mục 28. Tức là bản ghép 3 seed vẫn dao động khoảng 0.02. Mọi cải tiến ≤ 0.02 của `noc_deep` từ mục 26 tới đây
+**chưa phân biệt được với nhiễu**.
+
+## 30. 5 seed: E3, M-h, M-h2 (dạy thẳng cổng thứ k), cùng cỡ dữ liệu (fold 0 và 6, local, 2026-10-02)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 14. Mọi bản dùng 15.095 hồ sơ train, seed 42–46. Zero-shot argmax.
+
+| | fold 0: TB ± sd (5 seed) | fold 0: ghép 5 seed | fold 6: TB ± sd | fold 6: ghép 5 seed | khoảng cách trung vị tổng cổng NOC5 − NOC4 |
+|---|---|---|---|---|---|
+| E3 | 0.669 ± 0.012 | 0.674 | 0.676 ± 0.010 | 0.678 | — |
+| M-h | 0.660 ± 0.016 | 0.660 | 0.691 ± 0.011 | 0.693 | 0.21 / 0.21 |
+| M-h2 | 0.661 ± 0.020 | 0.663 | 0.683 ± 0.027 | 0.686 | 0.21 / 0.20 |
+
+- **R1 (M-h2 ≥ M-h + 0.02, cả hai fold): SAI.**
+- **R2 (khoảng cách NOC5 − NOC4 tăng gấp đôi): SAI.** Không đổi.
+- **R3:** không bản nào hơn bản khác quá 2 × sd.
+
+**Kết luận về `noc_deep`:** ba cách đếm (đầu thứ tự, tổng cổng slot, dạy thẳng cổng thứ k) **ngang nhau trong mức nhiễu**,
+khoảng 0.66–0.69 ở 15k hồ sơ. Ranh giới NOC4/5 không tách được dù đổi cách đọc. Ngay trên DEV in-silico, `noc_deep` cũng
+chỉ đạt khoảng 0.65. Tức là giới hạn nằm ở **bằng chứng vật lý trong dữ liệu** (người góp ít rất mờ, mục 24), chứ không ở cách
+đọc. Mạnh đã chốt không sửa dữ liệu, nên dừng các cải tiến nhỏ phía model ở đây.
+
+## 31. Dạy lại đầu đếm của backbone bằng NOC THẬT trên 6k hồ sơ sinh, backbone đóng băng (fold 0 và 6, 2026-10-02)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 17. Script: `work/simhead.py`. Dùng backbone 50k của đợt 10 fold, 6.000 hồ sơ sinh.
+
+| zero-shot (0 nhãn thật) | fold 0 | fold 6 |
+|---|---|---|
+| `logits_card` (nhãn suy từ ID) | 0.8025 | 0.8884 |
+| **`sim_card`** (cùng `Linear(45→5)` trên gate, dạy bằng **NOC thật**) | **0.9141** | **0.9005** |
+| `sim_inv` (đặc trưng `head_only`) | 0.9009 | 0.8700 |
+| `sim_invmac` | 0.8944 | 0.8752 |
+| `sim_sum` (chỉ đọc tổng gate) | 0.6463 | 0.7758 |
+
+Recall NOC4 / NOC5 của `sim_card`: fold 0 là 0.893 / 0.820 (`logits_card`: khoảng 0.81 / 0.37); fold 6 là 0.767 / 0.881.
+
+| fine-tune `head_only`, 371 nhãn, strict (giao thức deepNoC) | fold 0 | fold 6 |
+|---|---|---|
+| từ đầu, cấu hình hiện tại | 0.864 (0.925) | 0.891 (0.914) |
+| từ đầu, **cấu hình deepNoC** (Adam 1e-5, β1 0.5, 2000 epoch) | 0.735 (0.775) | 0.705 (0.723) |
+| **khởi tạo từ `sim_inv`**, cấu hình hiện tại | **0.920** (0.941) | 0.898 (0.914) |
+| khởi tạo từ `sim_inv`, cấu hình deepNoC | **0.925** (0.939) | 0.898 (0.919) |
+
+- **P1** (head tốt nhất ≥ `logits_card` + 0.02 ở cả hai fold): **SAI**. fold 0 tăng +0.112, fold 6 chỉ +0.012.
+- **P2** (khởi tạo từ `sim_inv` ≥ từ đầu + 0.01 ở cả hai fold): **SAI**. fold 0 tăng +0.056, fold 6 chỉ +0.007.
+- **P3:** cấu hình deepNoC khi train từ đầu thì kém hẳn (lr 1e-5 quá chậm cho head mới). Khi khởi tạo từ `sim_inv` thì ngang cấu hình hiện tại.
+
+Cả hai giả thuyết sai **vì fold 6**. Nhưng hướng thay đổi nhất quán, và mức tăng rất lớn ở fold 0, đúng là fold mà `logits_card`
+gọi thiếu NOC5 nặng nhất. Sửa M1 (dạy bằng NOC thật) có tác dụng. Kiểm thêm trên 8 fold còn lại; báo cáo như phân tích mở rộng,
+không đổi kết luận của P1/P2.
+
+## 32. `noc_deep` với 89 đặc trưng/peak như deepNoC (`--feats deep89`), không dính ID (fold 0 và 6, local, 2026-10-03)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 18. Chỉ đổi đầu vào; kiến trúc, loss, aux, lịch train như E3.
+- 15.095 hồ sơ train, DEV 2.152, seed 42–46, 25 epoch.
+- Script: `work/run_match5.sh deep89 --feats deep89 --loss ordinal --aux 0.5`.
+- Kết quả ở `work/noc_deep/match5/deep89*`.
+
+**Kiểm phụ:**
+- plp (HistGB trên peak sinh) có AUC **0.996** trên peak DEV sinh ở cả hai fold.
+- Đếm theo peak có plp > 0,5, trung vị max/locus trên test thật NOC1..5 là 3/4/6/7/7. Đếm theo peak thô là 9/10/11/12/12.
+
+| zero-shot, argmax | fold 0: TB ± sd 5 seed (ghép) | fold 6: TB ± sd (ghép) | recall NOC4 bản ghép, fold 0 / 6 | DEV in-silico |
+|---|---|---|---|---|
+| E3 (14 đặc trưng, mục 30) | 0.669 ± 0.012 (0.674) | 0.676 ± 0.010 (0.678) | 0.32 / 0.33 | ~0.65 |
+| **deep89** | **0.722 ± 0.018** (0.726) | **0.726 ± 0.038** (0.745) | **0.53 / 0.52** | 0.72 / 0.71 |
+| deep89nf (bỏ mọi cột tần số) | 0.712 ± 0.009 (0.711) | 0.718 ± 0.042 (0.731) | 0.45 / 0.54 | |
+
+**371 nhãn thật** (s42; strict TB ± sd 3 lần rút; giao thức deepNoC trong ngoặc):
+
+| | fold 0 | fold 6 |
+|---|---|---|
+| E3, hiệu chỉnh 6 tham số (bản ghép) | 0.683 (0.703) | 0.677 (0.725) |
+| deep89, hiệu chỉnh 6 tham số (bản ghép) | 0.737 (0.771) | 0.726 (0.751) |
+| E3, fine-tune đầu cuối | 0.690 (0.702) | 0.694 (0.741) |
+| deep89, fine-tune đầu cuối | 0.725 (0.769) | 0.728 (0.763) |
+| E3, fine-tune toàn nhánh | 0.718 (0.783) | 0.685 (0.809) |
+| **deep89, fine-tune toàn nhánh** | **0.738** (0.823) | **0.728** (0.848) |
+
+*fold 6, deep89: hai dòng fine-tune trùng 0.7284 là trùng hợp do làm tròn. Đã kiểm từng lần rút: đầu cuối 0.7274/0.7351/0.7227,
+toàn nhánh 0.7234/0.7356/0.7260, dự đoán khác nhau.*
+
+- **F1 (zero-shot ≥ E3 + 0.03, cả hai fold): ĐÚNG**, +0.053 / +0.050. Sd giữa seed ở fold 6 lớn (0.04).
+- **F2 (recall NOC4 +0.10): ĐÚNG**, +0.21 / +0.19.
+- **F3 (bỏ tần số kém ≤ 0.02): ĐÚNG**, −0.010 / −0.009. Phần tăng không đến từ tần số lấy từ panel.
+- **F4 (fine-tune toàn nhánh strict ≥ E3 + 0.03, cả hai fold): SAI.** fold 0 chỉ +0.019; fold 6 +0.043.
+
+**Đọc kết quả:**
+1. Đặc trưng ngữ cảnh stutter + plp của deepNoC là **thông tin thật cho việc đếm**. DEV in-silico tăng 0.65 → 0.72, nên
+   kết luận ở mục 30 ("giới hạn nằm ở bằng chứng vật lý trong dữ liệu") là **quá vội**. Giới hạn một phần nằm ở đầu vào.
+2. Với 371 nhãn, strict chỉ tăng thêm khoảng 0.01 so với zero-shot.
+   - Fine-tune toàn nhánh chủ yếu tăng điểm theo giao thức deepNoC: lợi thế dùng lại tổ hợp là +0.09 / +0.12, giống mục 27.
+   - Dưới giao thức deepNoC, nhánh không dính ID đạt **0.82–0.85**. Đó là cùng kiểu con số mà deepNoC báo, nhưng phần lớn
+     là lợi thế dùng lại tổ hợp.
+3. Nhánh không dính ID vẫn kém `logits_card` (0.813, cùng 12k) khoảng 0.09 ở zero-shot, và kém `head_only` (0.903) ở strict.
+
+## 33. Nhánh NoC trong chính Set Transformer, không dính ID, CHỈ zero-shot (fold 0 và 6, local MPS, demo, 2026-10-03)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 19.
+- Mọi bản dùng 6.000 hồ sơ sinh, DEV sinh 1.000, **10 epoch**, seed 42–44. Zero-shot argmax trên test thật in-panel.
+- Driver: `work/stbranch.py`, `work/run_stbranch.sh`. Kết quả ở `work/stbranch/fold*`.
+- `[ID GUARD]` đạt ở cả 12 lần chạy: tham số backbone không đổi, `fp(logits_cls)` trùng (fold 0 `9949e6dec0`, fold 6 `306bfa526a`).
+
+| zero-shot, TB ± sd (3 seed) | fold 0 | fold 6 | DEV sinh fold 0 / 6 |
+|---|---|---|---|
+| deep89 (`noc_deep`, 89 đặc trưng tự thiết kế), cùng 6k, 10 epoch | 0.638 ± 0.037 | 0.668 ± 0.027 | 0.67 / 0.64 |
+| nhánh ST `scratch` (tự học từ token thô) | 0.669 ± 0.006 | 0.638 ± 0.025 | 0.62 / 0.60 |
+| **nhánh ST `backbone`** (đầu vào = encoder 50k đóng băng) | **0.704 ± 0.029** | **0.694 ± 0.027** | 0.72 / 0.66 |
+| *`logits_card` của cùng backbone (dính ID)* | *0.8025* | *0.8884* | |
+
+Recall NOC1..5 của bản `backbone` (TB 3 seed):
+- fold 0: 0.92 / 0.76 / 0.65 / 0.40 / 0.83;
+- fold 6: 0.88 / 0.86 / 0.66 / 0.42 / 0.78.
+
+- **G1 (backbone ≥ deep89 + 0.03, cả hai fold): SAI ở cấu hình này.** fold 0 +0.066, fold 6 chỉ +0.026. Sd giữa seed khoảng 0.03, cỡ bằng chênh lệch.
+- **G2 (≥ `logits_card`): SAI.** Kém 0.10 / 0.19.
+- **G3 (backbone ≥ scratch + 0.02, cả hai fold): ĐÚNG**, +0.035 / +0.056. Biểu diễn mà encoder học (khi train ID) có ích cho
+  việc đếm, kể cả khi nhánh đọc trên bộ peak không lọc panel và không đọc slot/gate/ID.
+
+Lượt 25 epoch fold 0 (đã xem trước khi đổi sang 10 epoch, lưu ở `work/stbranch/ep25`): backbone 0.725 TB, scratch 0.674 TB.
+
+**Đọc kết quả:**
+1. Nhánh ST đọc đặc trưng đã học của encoder **không cần 89 đặc trưng tự thiết kế** mà vẫn ngang hoặc hơn deep89 ở cùng cỡ dữ liệu.
+2. Mọi cách đếm không dính ID (noc_deep, deep89, nhánh ST) đều dừng quanh 0.64–0.73 ở 6–15k hồ sơ sinh. `logits_card` đạt
+   0.80–0.89 vì đọc slot genotype, tức dùng thông tin panel/ID.
+3. Ở mẫu nhỏ (6k, 10 epoch), sd giữa seed khoảng 0.03. Muốn phân biệt chênh ≤ 0.03 cần thêm seed hoặc thêm dữ liệu.
+
+## 34. Đường cong theo cỡ dữ liệu: nhánh ST `backbone`, CHỈ strict, zero-shot (fold 0 và 6, local MPS, 2026-10-03)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 20. Cấu hình như mục 33: 10 epoch, DEV sinh 1.000, seed 42–44.
+Script: `work/run_curve.sh`. Cả 12 lần chạy mới đều đạt `[STRICT] shared 0` và `[ID GUARD]`.
+
+| zero-shot, TB ± sd (3 seed) | 6.000 | 15.000 | toàn bộ (47.494 / 47.267) | `logits_card` (dính ID) |
+|---|---|---|---|---|
+| fold 0 | 0.704 ± 0.029 | 0.773 ± 0.028 | **0.795 ± 0.009** | 0.8025 |
+| fold 6 | 0.694 ± 0.027 | 0.730 ± 0.016 | **0.803 ± 0.015** | 0.8884 |
+| DEV sinh fold 0 / 6 | 0.72 / 0.66 | 0.75 / 0.69 | 0.78 / 0.75 | |
+
+Recall NOC1..5 ở bản toàn bộ:
+- fold 0: 0.98 / 0.85 / 0.74 / 0.63 / 0.79;
+- fold 6: 0.97 / 0.91 / 0.78 / 0.63 / 0.76.
+
+- **C1 (tăng theo cỡ dữ liệu; bản toàn bộ ≥ 6k + 0.03, cả hai fold): ĐÚNG.** Tăng +0.091 / +0.109 và đơn điệu ở cả hai fold.
+- **C2 (khoảng cách tới `logits_card` thu hẹp ≥ một nửa): ĐÚNG.** fold 0 giảm từ 0.099 còn 0.008; fold 6 từ 0.195 còn 0.086.
+- Ở bản toàn bộ, **cả 6 lần chạy đều chọn epoch 10**, tức là epoch cuối. Mô hình chưa bão hoà ở 10 epoch. Không chỉnh theo
+  test; nếu tăng epoch thì phải ghi trước như một thí nghiệm mới.
+
+**Đọc kết quả:**
+1. Nhánh NoC không dính ID (không panel, không slot/gate/ID) với đủ dữ liệu sinh **gần bằng `logits_card`** ở fold 0
+   (0.795 so với 0.803). Ở fold 6 còn kém 0.086.
+2. Dưới 10k hồ sơ, sd giữa seed khoảng 0.03. Ở 47k còn 0.01–0.015.
+3. Đây là chấm strict: tổ hợp test chưa từng gặp, tiêm 5/15/25 s, 0 nhãn thật.
+
+## 35. Train 60.000 hồ sơ: nhánh ST `backbone`, CHỈ strict, zero-shot (fold 0 và 6, local MPS, 2026-10-03)
+
+Đã ghi trước ở `chay_10fold_zeroshot50k.md`, mục 21. Dữ liệu: `work/build_extra.py`.
+- Cùng generator và cờ, seed 43. Bỏ các hỗn hợp mới trùng tổ hợp DEV/test: 691 ở fold 0, 637 ở fold 6. Thêm 12.506 / 12.733 hỗn hợp.
+- Cả 6 lần chạy đều đạt `[STRICT] shared 0` và `[ID GUARD]`.
+
+| zero-shot, TB ± sd (3 seed) | 47k (mục 34) | **60k** | `logits_card` (dính ID) |
+|---|---|---|---|
+| fold 0 | 0.795 ± 0.009 | **0.810 ± 0.009** | 0.8025 |
+| fold 6 | 0.803 ± 0.015 | **0.801 ± 0.003** | 0.8884 |
+| DEV sinh fold 0 / 6 | 0.776 / 0.746 | 0.786 / 0.751 | |
+| recall NOC4 fold 0 / 6 | 0.63 / 0.63 | 0.65 / 0.61 | |
+
+- **K1 (60k ≥ 47k + 0.01, cả hai fold): SAI.** fold 0 +0.015; fold 6 −0.002 (trong nhiễu).
+- **K2:** 5/6 lần chạy vẫn chọn epoch cuối (fold 0 s44 chọn epoch 9). Mô hình chưa bão hoà ở 10 epoch.
+
+**Đọc kết quả:**
+1. Ở fold 0, nhánh không dính ID (0.810) **đã vượt `logits_card`** (0.8025) của cùng backbone.
+2. Ở fold 6, kết quả đứng ở 0.80 từ 47k sang 60k. Khoảng cách tới `logits_card` vẫn 0.088.
+3. Kết luận theo luật đã ghi: "từ 47k lên 60k không đủ để thấy khác biệt ở cả hai fold với 10 epoch". **Không** khái quát thành
+   "thêm dữ liệu không giúp". Vì gần như mọi lần đều chọn epoch cuối, biến tiếp theo nên thử là số epoch.
