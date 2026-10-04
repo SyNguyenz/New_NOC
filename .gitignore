@@ -35,9 +35,7 @@ inc22_clean/data_raw/
 results/
 
 # Large generated dataset splits (regenerate via synth/generate_dataset.py)
-data/synth/raw_synth_train.csv
-data/synth/raw_synth_val.csv
-data/meta.json
+/data/
 
 # Side analyses kept locally, not part of this project's source
 code/NOC_task/
