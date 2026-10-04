@@ -12,23 +12,27 @@ Design (per request): readers of the SAME source are MERGED; readers of DIFFEREN
       synth/extract_genotypes.py (tokens)               -> donor_genotypes.csv
       build_real_attr.py         (geno csv + tokens)    -> attr
       features/enrich.py         (tokens)               -> tokens8/9/11
-      make_insilico.py           (data/)                -> data_insilico_w/   [STR_DROPIN=0: inc22 has no drop-in]
+      make_insilico.py           (data/)                -> data_insilico_w/
 
 All clean-local (HERE = inc22_clean/; data_raw is the junction to root). Verify with verify_preprocess.py.
 """
 from __future__ import annotations
-import glob, json, os, re, subprocess, sys
+import glob, json, os, re, shutil, subprocess, sys
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "data"
 RAW_FILTERED = HERE / "data_raw" / "PROVEDIt_1-5-Person CSVs Filtered"
 KIT_PATTERN = str(RAW_FILTERED / "*GF29cycles" / "**" / "*.csv")
-MAX_SEQ = 160
+# Peaks per profile kept as tokens. 160 cut 7-10 % of the real NOC4-5 profiles (up to 176 peaks) and 20 % of the
+# in-silico NOC5 (up to 191), and the two sides were cut differently: real in CSV order, which drops whole loci of the
+# last dye, tall alleles included; the generator by keeping the tallest. The most any GF profile carries is 214, so
+# 224 cuts nothing; if one ever exceeds it, the tallest are kept on both sides.
+MAX_SEQ = 224
 RANDOM_SEED = 42
 PY = sys.executable
 
@@ -192,11 +196,16 @@ def csv_pass():
 
     tokens_arr = np.zeros((len(sample_files), MAX_SEQ, 3), dtype=np.float32)
     mask_arr = np.zeros((len(sample_files), MAX_SEQ), dtype=bool)
+    n_cut = 0
     for i, sf in enumerate(sample_files):
         toks = sample_tokens[sf]
-        n = min(len(toks), MAX_SEQ)
-        tokens_arr[i, :n, :] = np.array(toks[:n], dtype=np.float32)
+        if len(toks) > MAX_SEQ:                     # see MAX_SEQ: the tallest are kept, as the generator keeps them
+            keep = sorted(np.argsort([-t[2] for t in toks], kind="stable")[:MAX_SEQ])
+            toks = [toks[k] for k in keep]; n_cut += 1
+        n = len(toks)
+        tokens_arr[i, :n, :] = np.array(toks, dtype=np.float32)
         mask_arr[i, :n] = True
+    print(f"  profiles over MAX_SEQ={MAX_SEQ} (tallest kept): {n_cut}")
     flat_arr = np.stack([sample_flats[sf] for sf in sample_files])
 
     # ===== group-aware split (verbatim: prepare_data_set) =====
@@ -228,9 +237,20 @@ def csv_pass():
     multi_test = sorted(sample_combo)
     single_idx = np.array([i for i in closed_idx if int(nocs[i]) == 1])
     donor_labels = np.array([KNOWN_DONORS.index(sample_donors[sample_files[i]][0]) for i in single_idx])
-    ss_train, ss_tmp, _, ss_lbl_tmp = train_test_split(
-        single_idx, donor_labels, test_size=0.30, random_state=RANDOM_SEED, stratify=donor_labels)
-    ss_val, ss_test = train_test_split(ss_tmp, test_size=0.50, random_state=RANDOM_SEED, stratify=ss_lbl_tmp)
+    # Split by PCR TUBE, stratified by donor: the 5 / 15 / 25 sec injections of one amplification are near-copies of
+    # each other, so a sample-level split put another injection of 91% of the test NOC1 profiles into train. All
+    # injections of a tube now land in one split (20 folds of tubes: 3 -> test, 3 -> val, 14 -> train, ~70/15/15).
+    tube = np.array([re.sub(r"\.\d+\s*sec.*$", "", sample_files[i]) for i in single_idx])
+    folds = list(StratifiedGroupKFold(n_splits=20, shuffle=True, random_state=RANDOM_SEED)
+                 .split(single_idx, donor_labels, groups=tube))
+    part = np.zeros(len(single_idx), int)                  # 0 train, 1 val, 2 test
+    for f, (_, ix) in enumerate(folds):
+        part[ix] = 2 if f < 3 else (1 if f < 6 else 0)
+    ss_train, ss_val, ss_test = single_idx[part == 0], single_idx[part == 1], single_idx[part == 2]
+    assert not (set(tube[part == 0]) & set(tube[part != 0])), "a PCR tube is split across train and val/test"
+    assert set(donor_labels[part == 0]) == set(donor_labels), "a donor has no NOC1 training profile"
+    print(f"  NOC1 split by PCR tube: train {len(ss_train)} / val {len(ss_val)} / test {len(ss_test)} "
+          f"({len(set(tube))} tubes)")
     idx_train = ss_train                                   # single-source only
     idx_val = ss_val                                       # single-source only (k=1 rows for RF count)
     idx_test = np.concatenate([ss_test, np.array(multi_test, dtype=ss_test.dtype)])
@@ -321,7 +341,7 @@ def csv_pass():
 
 def step(rel, env_extra=None, args=()):
     """Run a SEPARATE-source proven script as its own process (verbatim, bit-identical)."""
-    env = {**os.environ, "STR_DROPIN": "0"}
+    env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
     print(f"\n>>> {rel} {' '.join(args)}")
@@ -330,14 +350,41 @@ def step(rel, env_extra=None, args=()):
 
 def main():
     assert (HERE / "data_raw").exists(), f"data_raw junction missing at {HERE/'data_raw'}"
+    # EVERYTHING BELOW BELONGS TO THIS FOLD. data/ and data_insilico_w/ are emptied first, so no step can read what an
+    # earlier run (another fold) left there: each calibration step imports make_insilico, which loads every
+    # calibration file present in data/, and calibrate.py caches pullup_pairs.json from that fold's profiles. Each
+    # calibration is then an increment over the generator with exactly the laws calibrated before it in this run.
+    for d in (DATA_DIR, HERE / "data_insilico_w"):
+        if d.exists():
+            shutil.rmtree(d)
+    print(f"fold {FOLD}: data/ and data_insilico_w/ cleared, rebuilding from data_raw")
     csv_pass()                                                         # GF29 CSVs (MERGED) -> base + size
     step("build_donor_geno.py")                                       # xlsx        -> donor_geno + mask
     step("extract_phi_condition.py")                                  # names       -> phi/condition
     step("synth/extract_genotypes.py")                                # tokens      -> donor_genotypes.csv
     step("build_real_attr.py")                                        # geno+tokens -> attr
     step("features/enrich.py", args=(str(DATA_DIR),))                 # tokens      -> tokens8/9/11
-    step("make_insilico.py",                                          # data/       -> data_insilico_w (no drop-in)
+    step("calibrate_scatter.py",                                      # NOC1 + twin -> art_scatter.json (width of the
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # stutter ratio draw, per offset, from its tail)
+    step("calibrate_pullup.py",                                       # NOC1 + twin -> pullup_emit.json (the pull-up
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # the analysis could not call; an increment too)
+    step("calibrate_allele_stut.py",                                  # NOC1 + twin -> allele_stut.json (per-allele
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # n-1 rate: an increment over the generator,
+                                                                      # so it is re-measured against the one in use)
+    step("calibrate_shoulder.py",                                     # NOC1 + twin -> shoulder_bp.json (a peak 1/2/3
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # bp from an allele: survival and floor by distance)
+    step("calibrate_donor_stut.py",                                   # NOC1 + twin -> donor_stut.json (n-1 emission per
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # donor x allele: same-length alleles that do not stutter)
+    step("calibrate_stut_spread.py",                                  # NOC1 + twin -> stut_spread.json (n-1 scatter
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # width by parent height: less scatter, more copies)
+    step("calibrate_stut_parent.py",                                  # NOC1 + twin -> stut_parent.json (stutter vs
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # parent height, floor separated; after allele_stut)
+    step("calibrate_crowd.py",                                        # TRAIN NOC1 + twin -> noise_cr_inc.json (noise
+         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # floor vs crowding, over all the laws above)
+    step("make_insilico.py",                                         # data/       -> data_insilico_w (no drop-in)
          env_extra={"STR_DATA_DIR": str(DATA_DIR), "STR_OUT_DIR": str(HERE / "data_insilico_w")},
+         # every in-silico mixture draws its treatment, tube Q, template and injection from ranges measured on
+         # TRAIN NOC1 (gen_conditioned), which is what puts the calibrated presence/height laws into training.
          args=("--build", "50000", "--noc_weights", "1,1.5,2.5,2", "--seed", "42"))
     print("\nDONE — full inc22 dataset built in inc22_clean/ (data/ + data_insilico_w/).")
 
