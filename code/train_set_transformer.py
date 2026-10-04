@@ -1,35 +1,27 @@
 """
-train_set_transformer.py — CLEAN, STANDALONE trainer for the `inc22_fixed_aslot` arm ONLY.
+train_set_transformer.py — trainer + test-time decode for the set-transformer contributor model.
 
-Faithful extraction of the single inc22 code path from train_set_transformer.py:
   * model  = SetTransformerMixture (CoSA+GSANet+MESH+AdaSlot, isab++/nc_mab0, periodic embed, aux heads,
              set_of_set, feas_filter). See models/set_transformer.py.
   * loss   = ASL(gamma_neg=4) on logits_cls
-             + 0.5 * BCE(reject, closed-0 / open-1)
-             + 0.05 * SmoothL1(sum gate, NOC)                   (tier B: live slots ARE the count)
+             + 0.05 * SmoothL1(sum gate, NOC)                   (the live AdaSlot slots ARE the count)
+             + 0.3 * CORN(noc_head_v2)                          (detached inputs; trained, never decoded)
              + Kendall( soft_attr_label CE  +  L1 phi )         (aux_heads, soft_attr_label)
-  * train aug = mask_peaks 0.15 shared / mask_private 0.0 single-carrier
-  * selection = macro-over-NOC oracle Recall@k on the in-silico DEV split (else real val).
-                No early stopping; best_model.pt = best DEV epoch, last_model.pt = final epoch.
+  * train aug = mask_peaks 0.15 on shared peaks (private peaks are never masked)
+  * selection = macro-over-NOC oracle Recall@k on the val split. No early stopping;
+                best_model.pt = best DEV epoch, last_model.pt = final epoch.
 
-DECODE:
-  1. phi_rerank: independent EM mixture-proportion deconvolution -> logarithmic-opinion-pool rerank
-     of the per-donor logits (alpha tuned on val).  Reranks the RANKING (which donors) only.
-  2. COUNT = tierA_count: MLP on permutation-invariant aggregates, fit on in-silico + real NOC1
-     only, so no labelled real mixture is needed.  The CORN head (noc_head_v2) is TRAINED but never
-     decoded; dropping it measurably hurt.
-  3. decode top-k_post of the reranked ranking.  oracle = top-true-k of the reranked ranking (ceiling).
+Training sees the CLOSED set only (panel donors); the open split (samples with a donor outside the panel) is test.
 
-Everything inc22 does NOT use was removed (no replicates / em_phi / noise_gate / ref_match /
-soft_geno_attr / sparse_attn / minor_weight / irm / vicreg / rnc / distill / the flag zoo).
-`--noc_head_v2` IS kept: verify_corn_port shows the published checkpoint's ord_count_head loads
-and reproduces logits_count_v2 exactly, and its gradient enters the global clip_grad_norm_
-denominator (|g_corn| ~ |g_rest|, 90% of steps clipped) — dropping it is NOT training-neutral.
+DECODE (decode_layer.py, every parameter chosen on val, no real mixture label is read):
+  penalty + bonus on the gate -> k = round(sum corrected gate); order = set-conditional greedy on the
+  phi-reranked logits; the k-th pick is dropped when it explains almost nothing new; open score from how well the
+  decoded set fits the panel, flagged above the 95th percentile of val.
 
-Run (STR_DATA_DIR points at the enriched, dev-split data dir; donor_geno.npy must be present there
-or under ./data):
-    STR_DATA_DIR=<data_dir> python train_set_transformer.py --seed 42 --out_subdir inc22_fixed_aslot
-Writes results/<out_subdir>_seed<seed>/{best_model.pt, metrics.json, y_test_pred.npy, y_test_true.npy}.
+Run (STR_DATA_DIR = an enriched data dir with gen_law.npy):
+    STR_DATA_DIR=<data_dir> python train_set_transformer.py --seed 42 --out_subdir <name>
+Fine-tune:  STR_INIT_FROM=<ckpt> STR_EPOCHS=3 STR_LR=1e-4 ...      Evaluate only:  STR_EVAL_ONLY=1 STR_INIT_FROM=<ckpt>
+Writes results/<out_subdir>_seed<seed>/{best_model.pt, last_model.pt, metrics.json, y_test_pred.npy, y_test_true.npy}.
 """
 from __future__ import annotations
 
@@ -44,19 +36,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, RandomSampler
+from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import f1_score, roc_auc_score
-from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from models.set_transformer import SetTransformerMixture
 from models.ordinal import corn_loss
-import phi_rerank as pr
+import decode_layer as DL
+import gen_law as gl
 
-# Data dir (the orchestrator sets STR_DATA_DIR to the enriched, dev-split data_w).
+# Data dir (the orchestrator sets STR_DATA_DIR to the enriched data_w).
 DATA_DIR = Path(os.environ.get("STR_DATA_DIR", str(ROOT / "data_insilico_w")))
 
 
@@ -79,20 +69,17 @@ DEVICE = _pick_device()
 ALLELE_OFF = 30
 LUT_W = 1024
 
-# ── Fixed inc22 configuration (the `configs/set_transformer.json` base + the inc22 flags) ──
+# ── Fixed configuration ──
 CFG = {
     "n_loci": 24, "d_locus": 16, "d_model": 128, "n_heads": 4, "n_isab": 2, "m_inducing": 32,
     "n_classes": 45, "dropout": 0.1,
     "lr": 6e-4, "weight_decay": 1e-4, "batch_size": 256, "epochs": 150,   # no early stopping
-    "alpha_reject": 0.5, "open_ratio": 0.25,
     "n_token_feats": 8, "num_embed": "periodic", "periodic_sigma": 0.3, "n_freq": 8, "d_num_emb": 8,
     "encoder": "isab++", "nc_attn": "mab0", "cls_decoder": "aslot",
     "aux_heads": True, "set_of_set": True, "feas_filter": True, "soft_attr_label": True,
     "mask_peaks": 0.15, "mask_peaks_min": 8,
-    "mask_private": 0.0,       # drop rate for peaks carried by exactly one donor
     "n_slot_iters": 3, "ot_eps": 0.05, "ot_iters": 5, "gumbel_temp": 1.0,
     "loss": "asl", "asl_gamma_neg": 4.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
-    "phi_rerank": True,
     # CORN ordinal count head on DETACHED features. Decode never reads it, but the published run
     # trained with it and its gradient enters the global clip_grad_norm_ denominator; dropping it
     # measurably hurt (EM .9162 vs .9260, count error 5.37% vs 3.74%).
@@ -103,23 +90,17 @@ CFG = {
     # logits_cls via gate_logit, so this reaches the encoder — that is the point.
     "w_gate": 0.05,            # weight on SmoothL1(sum gate, NOC)
 }
-
-
-def tierA_count(model, train_ds, val_ds, test_ds):
-    """Count from permutation-invariant aggregates (train_noc_head.features): sorted prob profile,
-    sum/sorted gate, sorted normalised slot_mass, plus scale-invariant physical features.
-
-    Fit on the in-silico TRAIN split plus the real val split (single-source, supplies the k=1 rows).
-    No real MIXTURE label is used, so unlike the post-hoc RF this needs no labelled real mixtures."""
-    import train_noc_head as NH                      # lazy: module-level paths, no import-time work
-    F_ = lambda ds: NH.features(model, ds.tokens.numpy(), ds.mask.numpy())
-    Xtr = np.concatenate([F_(train_ds), F_(val_ds)])
-    ytr = np.concatenate([train_ds.noc.numpy(), val_ds.noc.numpy()]).clip(1, 5)
-    clf = make_pipeline(StandardScaler(), MLPClassifier((128, 64), max_iter=800, random_state=42,
-                                                        early_stopping=True, n_iter_no_change=25))
-    return clf.fit(Xtr, ytr).predict(F_(test_ds)).astype(int)
-
-
+# Warm start + schedule overrides, for finetuning an existing checkpoint on a new data mix without
+# forking the loss. STR_INIT_FROM loads weights AFTER feat_mean/feat_std are recomputed, so the
+# checkpoint's own normalisation is what survives — a finetune must keep the statistics it was
+# trained under. Unset = train from scratch, i.e. the shipped behaviour is unchanged.
+INIT_FROM = os.environ.get("STR_INIT_FROM", "").strip()
+# STR_EVAL_ONLY=1: no training - load STR_INIT_FROM and run the test-time decode/eval exactly as after training.
+EVAL_ONLY = os.environ.get("STR_EVAL_ONLY", "0") == "1"
+CFG["epochs"] = int(os.environ.get("STR_EPOCHS", CFG["epochs"]))
+CFG["lr"] = float(os.environ.get("STR_LR", CFG["lr"]))
+# STR_BATCH: 256 is the trained recipe; a 4 GB card needs 128 (256 spills out of VRAM at MAX_SEQ 224).
+CFG["batch_size"] = int(os.environ.get("STR_BATCH", CFG["batch_size"]))
 def set_seed(seed: int) -> torch.Generator:
     import random
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -154,14 +135,6 @@ class AsymmetricLoss(nn.Module):
         return -loss.mean()
 
 
-def topk_decode(probs, k_arr):
-    yp = np.zeros_like(probs, dtype=int)
-    for i in range(len(probs)):
-        k = int(max(1, min(5, round(k_arr[i]))))
-        yp[i, np.argsort(probs[i])[::-1][:k]] = 1
-    return yp
-
-
 def _pn_(lst):
     """per-NOC dict from a per_noc_em list (index 0 = overall)."""
     return {str(j): (None if np.isnan(lst[j]) else round(float(lst[j]), 4)) for j in range(1, 6)}
@@ -170,35 +143,6 @@ def _pn_(lst):
 def per_noc_em(y_true, y_pred, noc):
     e = np.all(y_true == y_pred, axis=1)
     return [e.mean()] + [e[noc == j].mean() if (noc == j).sum() else float("nan") for j in range(1, 6)]
-
-
-def loco_decode(L_te, y_te, noc_te, PHt, combo_id):
-    """LEAVE-ONE-COMBO-OUT fit of the phi-rerank alpha.
-
-    Every real donor-combo lives in test (the network trains on in-silico only), so each combo is
-    scored by an alpha fit on the OTHER combos only — group-disjoint, and every real mixture stays
-    reportable. The single-source test rows form one extra group.
-
-    Returns (rank_te, alphas_per_group, alpha_full). alpha_full is fit on ALL mixtures and is the
-    artifact you would ship; the per-group alphas keep the estimate honest.
-    """
-    mix = combo_id >= 0
-    groups = [np.where(combo_id == c)[0] for c in np.unique(combo_id[mix])]
-    ss = np.where(~mix)[0]
-    if len(ss):
-        groups.append(ss)
-    alpha_full = float(pr.tune_alpha(L_te[mix], PHt[mix], y_te[mix], noc_te[mix])) if mix.any() else 0.0
-
-    rank_te = np.zeros(L_te.shape, dtype=np.float64)
-    alphas = []
-    for g in groups:
-        held = np.zeros(len(L_te), bool); held[g] = True
-        fit = mix & ~held                       # other combos only — a group never fits on itself
-        assert not fit[g].any(), "leave-one-combo-out violated"
-        a = float(pr.tune_alpha(L_te[fit], PHt[fit], y_te[fit], noc_te[fit])) if fit.any() else alpha_full
-        alphas.append(a)
-        rank_te[g] = pr.rerank_scores(L_te[g], PHt[g], a)
-    return rank_te, alphas, alpha_full
 
 
 # ── Datasets ─────────────────────────────────────────────────────────────────
@@ -217,11 +161,20 @@ class ClosedSetDataset(Dataset):
             self.attr = torch.full((N, S), -1, dtype=torch.int64)
             self.phi  = torch.zeros((N, 45), dtype=torch.float32)
 
+        # the generator's TRUE per-peak split, when the set carries it (in-silico rows only)
+        fp = DATA_DIR / f"attrfrac_{split}.npy"; cp = DATA_DIR / f"attrcol_{split}.npy"
+        if fp.exists() and cp.exists():
+            self.frac = torch.from_numpy(np.load(fp).astype(np.float32))
+            self.fcol = torch.from_numpy(np.load(cp).astype(np.int64))
+        else:
+            self.frac = torch.zeros((N, S, 5)); self.fcol = torch.full((N, 5), -1, dtype=torch.int64)
+
     def __len__(self):
         return len(self.tokens)
 
     def __getitem__(self, i):
-        return self.tokens[i], self.mask[i], self.y[i], self.noc[i], self.attr[i], self.phi[i]
+        return (self.tokens[i], self.mask[i], self.y[i], self.noc[i], self.attr[i], self.phi[i],
+                self.frac[i], self.fcol[i])
 
 
 class OpenSetDataset(Dataset):
@@ -264,21 +217,6 @@ def evaluate_oracle_em(model, loader):
     return float(em.mean()), float(np.mean(strata))
 
 
-def per_noc_oracle_on_scores(S, Y, noc):
-    """Per-NOC oracle EM (full set correct at top-true-k) on a RANKING score S."""
-    N = np.clip(noc, 1, 5); out = {}
-    for j in range(1, 6):
-        m = np.where(N == j)[0]
-        if not len(m):
-            continue
-        ems = []
-        for i in m:
-            top = np.argsort(S[i])[::-1][:j]; pred = np.zeros(S.shape[1], int); pred[top] = 1
-            ems.append(bool((pred == Y[i]).all()))
-        out[str(j)] = round(float(np.mean(ems)), 4)
-    return out
-
-
 # ── owner_lut / cn_lut (carrier + copy-number LUTs from reference genotypes) ──
 def build_luts(donor_geno, donor_geno_mask, n_cls):
     gg = donor_geno; gm = donor_geno_mask.bool()
@@ -294,16 +232,13 @@ def build_luts(donor_geno, donor_geno_mask, n_cls):
     return owner, cn
 
 
-def train(seed: int, out_subdir: str, mask_private: float | None = None):
+def train(seed: int, out_subdir: str):
     cfg = dict(CFG); cfg["seed"] = seed; cfg["out_subdir"] = out_subdir
-    if mask_private is not None:
-        cfg["mask_private"] = mask_private
     results_dir = ROOT / "results" / f"{out_subdir}_seed{seed}"
     results_dir.mkdir(parents=True, exist_ok=True)
     gen = set_seed(seed)
     print(f"seed={seed}  data={DATA_DIR}  device={DEVICE}")
-    print(f"w_gate={cfg['w_gate']}  noc_head_v2={cfg['noc_head_v2']}  "
-          f"mask_peaks={cfg['mask_peaks']}/private={cfg['mask_private']}")
+    print(f"w_gate={cfg['w_gate']}  noc_head_v2={cfg['noc_head_v2']}  mask_peaks={cfg['mask_peaks']}")
 
     train_ds = ClosedSetDataset("train"); val_ds = ClosedSetDataset("val")
     test_ds = ClosedSetDataset("test"); open_ds = OpenSetDataset()
@@ -311,16 +246,8 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
                               num_workers=0, pin_memory=(DEVICE.type == "cuda"))
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
-    if (DATA_DIR / "tokens8_dev.npy").exists():
-        sel_loader = DataLoader(ClosedSetDataset("dev"), batch_size=256, shuffle=False)
-        print(f"selection set = in-silico DEV ({len(sel_loader.dataset)} samples)")
-    else:
-        sel_loader = val_loader; print("selection set = real val (no dev split found)")
-
-    open_iter = iter(DataLoader(
-        open_ds, sampler=RandomSampler(open_ds, replacement=True,
-                                       num_samples=len(train_ds) * cfg["epochs"], generator=gen),
-        batch_size=max(1, int(cfg["batch_size"] * cfg["open_ratio"])), num_workers=0))
+    sel_loader = val_loader
+    print(f"selection set = val ({len(val_ds)} samples: real NOC1 + combo-disjoint in-silico mixtures)")
 
     # reference genotypes + carrier/copy-number LUTs
     gp = DATA_DIR / "donor_geno.npy"
@@ -347,23 +274,25 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
     model.feat_mean.copy_(torch.tensor(_num.mean(0), dtype=torch.float32, device=DEVICE))
     model.feat_std.copy_(torch.tensor(_num.std(0) + 1e-6, dtype=torch.float32, device=DEVICE))
     print(f"params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    if INIT_FROM:
+        model.load_state_dict(torch.load(INIT_FROM, map_location=DEVICE, weights_only=True), strict=False)
+        print(f"warm start <- {INIT_FROM}")
 
     # ── Loss objects + weights ────────────────────────────────────────────────
     bce_cls = AsymmetricLoss(gamma_neg=cfg["asl_gamma_neg"], gamma_pos=cfg["asl_gamma_pos"], clip=cfg["asl_clip"])
-    bce_rej = nn.BCEWithLogitsLoss()
-    alpha = cfg["alpha_reject"]; w_gate = float(cfg["w_gate"])
+    w_gate = float(cfg["w_gate"])
     noc_v2_w = float(cfg["noc_v2_weight"])
     # Kendall homoscedastic-uncertainty weights for the privileged aux losses
     log_var_attr = torch.zeros((), device=DEVICE, requires_grad=True)
     log_var_phi  = torch.zeros((), device=DEVICE, requires_grad=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                  lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     optimizer.add_param_group({"params": [log_var_attr, log_var_phi], "weight_decay": 0.0})
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
                                                            patience=5, min_lr=1e-6)
 
     mask_peaks_p = cfg["mask_peaks"]; mask_min = cfg["mask_peaks_min"]
-    mask_private_p = float(cfg["mask_private"])
 
     def gather_owner(tok):
         loc = tok[:, :, 0].long().clamp(0, 23)
@@ -372,30 +301,29 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
 
     best_sel, best_epoch = 0.0, 0
     epochs = cfg["epochs"]; history = []
+    if EVAL_ONLY:                                                  # see EVAL_ONLY
+        assert INIT_FROM, "STR_EVAL_ONLY needs STR_INIT_FROM"
+        epochs = 0
+        torch.save(model.state_dict(), results_dir / "best_model.pt")
+        torch.save(model.state_dict(), results_dir / "last_model.pt")
     print(f"\nTraining {epochs} epochs (no early stopping) ...")
     t0 = time.time()
 
     for epoch in range(1, epochs + 1):
         model.train()
-        epoch_loss = epoch_cls = epoch_rej = epoch_attr = epoch_phi = 0.0
-        for tokens, mask, y, noc, attr, phi in train_loader:
+        epoch_loss = epoch_cls = epoch_attr = epoch_phi = 0.0
+        for tokens, mask, y, noc, attr, phi, frac, fcol in train_loader:
             tokens, mask = tokens.to(DEVICE), mask.to(DEVICE)
             y, noc = y.to(DEVICE), noc.to(DEVICE); attr = attr.to(DEVICE); phi = phi.to(DEVICE)
+            frac = frac.to(DEVICE); fcol = fcol.to(DEVICE)
 
-            # mask_peaks: drop a fraction of valid peaks, keeping >= mask_min so NOC stays
-            # identifiable.  SHARED peaks drop at mask_peaks; PRIVATE peaks (carried by exactly one
-            # donor) drop at mask_private, which is 0 by default = the original arm.
-            #
-            # Why private peaks are worth dropping: a private allele is what identifies a donor, and
-            # the model has never been trained to survive losing one. Measured consequence — a noise
-            # filter at 99.6% precision / 98.3% recall still costs -1.28pp EM because the <0.5% of
-            # true peaks it removes are exactly this kind, while a LABEL-PERFECT filter gains
-            # +1.95pp. The gap is the model's brittleness, not the filter's accuracy.
-            if mask_peaks_p > 0.0 or mask_private_p > 0.0:
+            # mask_peaks: drop a fraction of the SHARED peaks, keeping >= mask_min so NOC stays identifiable.
+            # A private peak (carried by exactly one donor) is never dropped: it is what identifies that donor.
+            if mask_peaks_p > 0.0:
                 mb = mask.bool()
                 r = torch.rand_like(mb, dtype=torch.float)
                 priv = gather_owner(tokens).sum(-1) == 1
-                drop = mb & torch.where(priv, r < mask_private_p, r < mask_peaks_p)
+                drop = mb & ~priv & (r < mask_peaks_p)
                 kept = mb & ~drop
                 enough = kept.sum(1, keepdim=True) >= mask_min
                 mask = torch.where(enough, kept, mb).to(mask.dtype)
@@ -403,23 +331,7 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
             out = model(tokens, mask)
             loss_cls = bce_cls(out["logits_cls"], y)
 
-            # reject: closed -> 0, open -> 1
-            try:
-                open_batch = next(open_iter)
-            except StopIteration:
-                open_iter = iter(DataLoader(
-                    open_ds, batch_size=max(1, int(cfg["batch_size"] * cfg["open_ratio"])),
-                    sampler=RandomSampler(open_ds, replacement=True, num_samples=len(open_ds) * 10,
-                                          generator=gen), num_workers=0))
-                open_batch = next(open_iter)
-            o_tok, o_mask = open_batch[0].to(DEVICE), open_batch[1].to(DEVICE)
-            rej_open = model(o_tok, o_mask)["logit_reject"]
-            all_rej = torch.cat([out["logit_reject"], rej_open], dim=0)
-            all_rej_lbl = torch.cat([torch.zeros(len(tokens), 1, device=DEVICE),
-                                     torch.ones(len(o_tok), 1, device=DEVICE)], dim=0)
-            loss_rej = bce_rej(all_rej, all_rej_lbl)
-
-            loss = loss_cls + alpha * loss_rej
+            loss = loss_cls
 
             # CORN count head on TRUE noc (noc_head_v2). Inputs are detached, so this adds no
             # encoder gradient — but it DOES add gradient mass to clip_grad_norm_, exactly as in
@@ -447,6 +359,17 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
                 norm_ = phi_cn_ / tot_.clamp(min=1e-9)
                 bg_ = (~feas_ & mask.bool()).unsqueeze(-1).float()
                 soft_y_ = torch.cat([norm_ * feas_.unsqueeze(-1).float(), bg_], dim=-1)
+                # WHERE THE GENERATOR KNOWS, USE WHAT IT KNOWS. The line above rebuilds the split from phi x copy
+                # number, which is a model of the split, not the split: it cannot tell that a faint contributor put
+                # 12% into this peak and nothing into that one. The generator computed the real thing and it is now
+                # kept (attrfrac_*), so those rows are supervised on it and only the real single sources fall back.
+                have_ = (fcol >= 0).any(1)
+                if have_.any():
+                    tgt = torch.zeros_like(soft_y_)
+                    ix = fcol.clamp(min=0).unsqueeze(1).expand(-1, frac.size(1), -1)
+                    tgt.scatter_(2, ix, frac * (fcol >= 0).unsqueeze(1).float())
+                    tgt[..., -1] = (1.0 - tgt[..., :-1].sum(-1)).clamp(min=0.0)   # the rest is artefact/noise
+                    soft_y_ = torch.where(have_.view(-1, 1, 1), tgt, soft_y_)
                 log_p_ = F.log_softmax(la, dim=-1)
                 raw_l_ = -(soft_y_ * log_p_).sum(-1)
                 vm_ = mask.bool().float()
@@ -463,7 +386,6 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
 
             bs = len(tokens)
             epoch_loss += loss.item() * bs; epoch_cls += loss_cls.item() * bs
-            epoch_rej += loss_rej.item() * bs
             epoch_attr += loss_attr_v * bs; epoch_phi += loss_phi_v * bs
 
         n = len(train_ds); epoch_loss /= n
@@ -474,13 +396,13 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
         history.append({"epoch": epoch, "loss": round(epoch_loss, 4), "val_macro_f1": round(val_f1, 4),
                         "val_oracle_em": round(val_em, 4), "val_macro_recall": round(val_macrec, 4)})
         if epoch % 10 == 0 or epoch == 1:
-            print(f"  Ep {epoch:3d} | loss={epoch_loss:.4f} (cls={epoch_cls/n:.3f} rej={epoch_rej/n:.3f} "
+            print(f"  Ep {epoch:3d} | loss={epoch_loss:.4f} (cls={epoch_cls/n:.3f} "
                   f"attr={epoch_attr/n:.3f} phi={epoch_phi/n:.3f}) "
                   f"| DEV macrec={val_macrec:.4f} em={val_em:.4f} f1={val_f1:.4f} "
                   + f"| lr={optimizer.param_groups[0]['lr']:.1e}")
 
         # NO early stopping: the selection metric saturates and a patience counter stops on noise.
-        # Always run the full `epochs`. `best_model.pt` = best in-silico DEV epoch, `last_model.pt` =
+        # Always run the full `epochs`. `best_model.pt` = best val epoch, `last_model.pt` =
         # final epoch, so both can be evaluated.
         if sel_score > best_sel:
             best_sel, best_epoch = sel_score, epoch
@@ -488,84 +410,70 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
         torch.save(model.state_dict(), results_dir / "last_model.pt")
     print(f"Training done in {time.time()-t0:.1f}s")
 
-    # ── Test eval: phi-rerank -> post-hoc RF count on the reranked score ────────
+    # ── Test eval: the decode layer (decode_layer.py), every parameter chosen on val ─────────
     model.load_state_dict(torch.load(results_dir / "best_model.pt", weights_only=True))
     model.eval()
+    dg = donor_geno.cpu().numpy(); dgm = donor_geno_mask.cpu().numpy().astype(bool)
+    law = gl.load_law(DATA_DIR / gl.LAW_FILE)
 
-    @torch.no_grad()
-    def infer(ds):
-        loader = DataLoader(ds, batch_size=256, shuffle=False)
-        L, Y, NOC, S = [], [], [], []
-        for tokens, mask, y, noc, *_ in loader:
-            o = model(tokens.to(DEVICE), mask.to(DEVICE))
-            L.append(o["logits_cls"].cpu().numpy()); S.append(o["gate"].sum(1).cpu().numpy())
-            Y.append(y.numpy()); NOC.append(noc.numpy())
-        L = np.concatenate(L)
-        return (L, 1.0 / (1.0 + np.exp(-L)), np.concatenate(Y), np.concatenate(NOC),
-                np.concatenate(S))
+    def split(ds):
+        return DL.Split(model, ds.tokens.numpy(), ds.mask.numpy(), ds.y.numpy(), ds.noc.numpy(), dg, dgm, law, DEVICE)
+    dev = split(val_ds); te = split(test_ds)
+    dcfg = DL.fit(dev)
+    y_te_pred, k_te = DL.apply(te, dcfg)
+    y_te_true, noc_te = te.y, te.noc
+    n_cls = y_te_true.shape[1]
 
-    L_te, P_te, y_te_true, noc_te, S_te = infer(test_ds)
-    L_va, P_va, y_va, noc_va, _ = infer(val_ds)
-
-    dg = donor_geno.cpu().numpy(); dgm = donor_geno_mask.cpu().numpy()
-    PHt = pr.deconv_phi(test_ds.tokens.numpy(), test_ds.mask.numpy(), dg, dgm)
-
-    # Decode = phi-rerank the RANKING (alpha fit leave-one-combo-out) + tierA_count for k.
-    cid_p = DATA_DIR / "combo_id_test.npy"
-    if cid_p.exists():
-        combo_id = np.load(cid_p).astype(int)
-        rank_te, alphas, alpha_pr = loco_decode(L_te, y_te_true, noc_te, PHt, combo_id)
-        n_groups = len(alphas)
-        print(f"phi_rerank: LOCO over {n_groups} groups, alpha/group={alphas}, shipped alpha={alpha_pr}")
-    else:
-        PHv = pr.deconv_phi(val_ds.tokens.numpy(), val_ds.mask.numpy(), dg, dgm)
-        alpha_pr = float(pr.tune_alpha(L_va, PHv, y_va, noc_va)); alphas = [alpha_pr]; n_groups = 1
-        rank_te = pr.rerank_scores(L_te, PHt, alpha_pr)
-        print(f"phi_rerank: val-tuned alpha={alpha_pr} (legacy path — combo_id_test.npy missing)")
-    decode_desc = "phi_rerank(ranking), LOCO alpha + tierA_count(invariant aggregates, synth-fit)"
-
-    # round(sum gate) is reported as the check on whether the gate learned to count; k comes from tierA.
-    k_gate = np.clip(np.rint(S_te), 1, 5).astype(int)
-    mix_ = noc_te >= 2
-    print(f"  count round(sum gate): acc {float((k_gate == np.clip(noc_te,1,5)).mean()):.4f}  "
-          f"acc_mix {float((k_gate[mix_] == noc_te[mix_]).mean()):.4f}  "
-          f"macroF1_mix {f1_score(np.clip(noc_te,1,5)[mix_], k_gate[mix_], average='macro', labels=[2,3,4,5], zero_division=0):.4f}  "
-          f"corr(sum gate, NOC) {float(np.corrcoef(S_te, noc_te)[0,1]):+.4f}")
-    k_post = tierA_count(model, train_ds, val_ds, test_ds)
-
-    y_te_pred = topk_decode(rank_te, k_post)
     em_post = per_noc_em(y_te_true, y_te_pred, noc_te)
-    oracle = per_noc_em(y_te_true, topk_decode(rank_te, noc_te), noc_te)
-    count_acc = float((np.clip(k_post, 1, 5) == np.clip(noc_te, 1, 5)).mean())
+    oracle = per_noc_em(y_te_true, DL.to_sets(te.picks, noc_te, n_cls), noc_te)
+    k_gate = np.clip(np.rint(te.G.sum(1)), 1, 5).astype(int)
 
-    print(f"  {'decode':<14}{'overall':>8}{'NOC1':>7}{'NOC2':>7}{'NOC3':>7}{'NOC4':>7}{'NOC5':>7}")
-    for nm, r in (("oracle", oracle), ("k=tierA", em_post)):
-        print(f"  {nm:<14}" + "".join(f"{x:>7.3f}" for x in r))
-    print(f"  count accuracy (k=tierA): {count_acc:.4f}")
+    def count_per_noc(k):
+        return [float((k == noc_te).mean())] + [float((k[noc_te == j] == j).mean()) if (noc_te == j).any()
+                                                else float("nan") for j in range(1, 6)]
+    noc_per = count_per_noc(k_te); gate_per = count_per_noc(k_gate)
+    mix_ = noc_te >= 2
 
-    # DEV per-NOC oracle on the reranked ranking (combo-generalization judge)
-    dev_oracle = None
-    if (DATA_DIR / "tokens8_dev.npy").exists():
-        dev_ds = ClosedSetDataset("dev")
-        L_dev, P_dev, y_dev, noc_dev, _ = infer(dev_ds)
-        PHd = pr.deconv_phi(dev_ds.tokens.numpy(), dev_ds.mask.numpy(), dg, dgm)
-        rank_dev = pr.rerank_scores(L_dev, PHd, alpha_pr)
-        dev_oracle = per_noc_oracle_on_scores(rank_dev, y_dev, noc_dev)
-        print(f"  DEV per-NOC oracle (reranked): {dev_oracle}")
+    def macro(lst):
+        return float(np.nanmean(lst[2:6]))
+    print(f"  {'':<26}{'overall':>8}{'NOC1':>7}{'NOC2':>7}{'NOC3':>7}{'NOC4':>7}{'NOC5':>7}")
+    for nm, r in (("ID @ true k (greedy order)", oracle), ("ID @ decoded k", em_post),
+                  ("NOC acc (decoded)", noc_per), ("NOC acc (round sum gate)", gate_per)):
+        print(f"  {nm:<26}" + "".join(f"{x:>7.3f}" for x in r))
+    print(f"  macro NOC2-5: ID {macro(em_post):.4f}  count {macro(noc_per):.4f}   "
+          f"under {int(((k_te < noc_te) & mix_).sum())} / over {int(((k_te > noc_te) & mix_).sum())}")
 
-    # reject AUROC (the reject head is part of the inc22 objective)
-    scores, labels = [], []
-    with torch.no_grad():
-        for tokens, mask, *_ in test_loader:
-            scores.append(torch.sigmoid(model(tokens.to(DEVICE), mask.to(DEVICE))["logit_reject"]).cpu().numpy())
-            labels.append(np.zeros(len(tokens)))
-        for o_tok, o_mask in DataLoader(open_ds, batch_size=256, shuffle=False):
-            scores.append(torch.sigmoid(model(o_tok.to(DEVICE), o_mask.to(DEVICE))["logit_reject"]).cpu().numpy())
-            labels.append(np.ones(len(o_tok)))
-    try:
-        auroc = float(roc_auc_score(np.concatenate(labels), np.concatenate(scores).ravel()))
-    except Exception:
-        auroc = None
+    # ── full precision / recall / F1 (per class, macro = unweighted mean over classes, micro = pooled) ──
+    rep_count = DL.multiclass_report(noc_te, np.clip(k_te, 1, 5), [1, 2, 3, 4, 5])
+    rep_id = {"all": DL.multilabel_report(y_te_true, y_te_pred), "mixtures": DL.multilabel_report(y_te_true[mix_], y_te_pred[mix_])}
+
+    # ── open set: samples with a donor outside the panel, never trained on. Closed test = 0, open = 1. ──
+    dcfg = DL.fit_open(dev, dcfg)
+    sc_te, fl_te = DL.open_score(te, dcfg, k_te)
+    op = DL.Split(model, open_ds.tokens.numpy(), open_ds.mask.numpy(), None, None, dg, dgm, law, DEVICE)
+    _, k_op = DL.apply(op, dcfg)
+    sc_op, fl_op = DL.open_score(op, dcfg, k_op)
+    np.save(results_dir / "open_score_test.npy", sc_te); np.save(results_dir / "open_score_open.npy", sc_op)
+    y_open = np.r_[np.zeros(len(sc_te), int), np.ones(len(sc_op), int)]
+    rep_open = DL.multiclass_report(y_open, np.r_[fl_te, fl_op].astype(int), [0, 1])
+    rep_open["auroc"] = float(roc_auc_score(y_open, np.r_[sc_te, sc_op]))
+    rep_open["open_flagged"] = float(fl_op.mean()); rep_open["closed_flagged"] = float(fl_te.mean())
+
+    def show(title, rep, names):
+        print(f"\n  {title}")
+        print(f"    {'class':<10}{'precision':>10}{'recall':>9}{'f1':>8}{'support':>9}")
+        for c, d in rep["per_class"].items():
+            print(f"    {names.get(c, c):<10}{d['precision']:>10.3f}{d['recall']:>9.3f}{d['f1']:>8.3f}{d['support']:>9d}")
+        for avg in ("macro", "micro"):
+            d = rep[avg]; print(f"    {avg:<10}{d['precision']:>10.3f}{d['recall']:>9.3f}{d['f1']:>8.3f}")
+    show("COUNT (NOC, closed test)", rep_count, {str(j): f"NOC{j}" for j in range(1, 6)})
+    print("\n  ID (donor-level, closed test)      precision  recall      f1")
+    for part, r in rep_id.items():
+        for avg in ("micro", "macro"):
+            d = r[avg]; print(f"    {part:<9}{avg:<6}{'':<15}{d['precision']:>9.3f}{d['recall']:>8.3f}{d['f1']:>8.3f}")
+    show(f"OPEN SET (closed test {len(sc_te)} vs open {len(sc_op)}; AUROC {rep_open['auroc']:.3f})", rep_open,
+         {"0": "closed", "1": "open"})
+    print(f"    flagged: open {rep_open['open_flagged']:.3f} | closed test {rep_open['closed_flagged']:.3f}")
 
     np.save(results_dir / "y_test_pred.npy", y_te_pred)
     np.save(results_dir / "y_test_true.npy", y_te_true)
@@ -576,23 +484,14 @@ def train(seed: int, out_subdir: str, mask_private: float | None = None):
     out_dict = {
         "model": "set_transformer", "config": cfg,
         "best_selection_score": round(best_sel, 4), "best_epoch": best_epoch,
-        "decode": decode_desc,
-        "phi_rerank_alpha": float(alpha_pr),
-        "phi_rerank_alpha_per_group": alphas,
-        "n_decode_groups": n_groups,
-        "n_test_mixtures": int((noc_te >= 2).sum()),
-        "em_at_pred_k": round(float(em_post[0]), 4),
-        "oracle_em": round(float(oracle[0]), 4),
-        "count_acc": round(count_acc, 4),
-        "count_acc_gate": round(float((k_gate == np.clip(noc_te, 1, 5)).mean()), 4),
-        "count_macro_f1_gate_mix": round(float(f1_score(
-            np.clip(noc_te, 1, 5)[mix_], k_gate[mix_], average="macro", labels=[2, 3, 4, 5],
-            zero_division=0)), 4),
-        "corr_sumgate_noc": round(float(np.corrcoef(S_te, noc_te)[0, 1]), 4),
-        "reject_auroc": auroc,
-        "per_noc_oracle": _pn(oracle),
-        "per_noc_at_pred_k": _pn(em_post),
-        "dev_per_noc_oracle": dev_oracle,
+        "decode": dcfg,
+        "n_test_mixtures": int(mix_.sum()),
+        "macro_id_mix": round(macro(em_post), 4), "macro_count_mix": round(macro(noc_per), 4),
+        "em_at_pred_k": round(float(em_post[0]), 4), "per_noc_at_pred_k": _pn(em_post),
+        "count_acc": round(float(noc_per[0]), 4), "per_noc_count": _pn(noc_per),
+        "count_acc_gate": round(float(gate_per[0]), 4), "per_noc_count_gate": _pn(gate_per),
+        "oracle_em": round(float(oracle[0]), 4), "per_noc_oracle": _pn(oracle),
+        "count_report": rep_count, "id_report": rep_id, "open_report": rep_open,
         "history": history,
     }
     with open(results_dir / "metrics.json", "w") as f:
@@ -604,8 +503,5 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Train the clean inc22_fixed_aslot pipeline.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_subdir", type=str, default="inc22_fixed_aslot")
-    ap.add_argument("--mask_private", type=float,
-                    default=float(os.environ.get("STR_MASK_PRIVATE", "0.0")),
-                    help="drop rate for single-carrier peaks during training (0.0 = original arm)")
     args = ap.parse_args()
-    train(args.seed, args.out_subdir, args.mask_private)
+    train(args.seed, args.out_subdir)

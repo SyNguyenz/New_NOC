@@ -5,12 +5,12 @@ Replaces kaggle_run_increment1.py for the inc22 case: ONE arm, no MACHINE/decorr
 replicate branching, no 60-arm job table.  Runs the full chain:
 
   [--from-raw]  data_raw/  ->  (proven extractors)  ->  data/  -> make_insilico ->  data_insilico_w/
-  (always)      data_insilico_w/  -> copy ->  data_w/  -> make_dev_split -> features/enrich
-  (always)      train_set_transformer.py (model + deployable phi-rerank -> post-hoc-RF-count decode)
+  (always)      data_insilico_w/  -> copy ->  data_w/  -> features/enrich
+  (always)      train_set_transformer.py (model + decode layer: penalty/bonus, set-height greedy, drop rule)
   -> results/<out_subdir>_seed<seed>/{best_model.pt, metrics.json, y_test_pred.npy, y_test_true.npy}
 
 The DATA-PREP scripts (extract_phi_condition, synth/extract_genotypes, build_real_attr, extract_size,
-make_insilico, make_dev_split, features/enrich) are the PROVEN, shared dataset generators — they are
+make_insilico, features/enrich) are the PROVEN, shared dataset generators — they are
 INVOKED UNCHANGED from the project root (not rewritten), because they define the exact in-silico
 dataset and rewriting them would change the data / break reproducibility.  The clean REWRITE is the
 inc22 training + model (train_set_transformer.py, models/set_transformer.py), which is where the complexity lived.
@@ -35,7 +35,7 @@ PY = sys.executable
 
 SRC  = Path(os.environ.get("INSILICO_W", str(PROJ / "data_insilico_w")))   # the built in-silico dataset
 WORK = Path(os.environ.get("WORK_DIR", str(PROJ)))                         # writable root
-DATA_W = WORK / "data_w_inc22"                                             # enriched, dev-split working copy
+DATA_W = WORK / "data_w_inc22"                                             # enriched working copy
 
 
 def run(cmd, env=None, cwd=PROJ):
@@ -44,23 +44,16 @@ def run(cmd, env=None, cwd=PROJ):
 
 
 def stage_raw_to_insilico():
-    """data_raw/ -> data/ (real phi/condition/genotypes/attr/size) -> make_insilico -> data_insilico_w/.
-    Exactly the proven LOCAL prep sequence (kaggle_run_increment1.py header)."""
+    """data_raw/ -> data/ -> calibration -> make_insilico -> data_insilico_w/, all for STR_FOLD: preprocess.py is the
+    one raw -> dataset chain (it clears data/ first, so nothing from another fold is read)."""
     assert (PROJ / "data_raw").exists(), f"data_raw/ not found at {PROJ/'data_raw'} (needs the PROVEDIt CSVs)"
-    run([PY, "prepare_data_set.py"])               # raw GF29cycles CSVs -> base tokens/mask/Xflat/y/noc/meta_set
-    run([PY, "build_donor_geno.py"])               # raw Known-Genotypes xlsx -> donor_geno.npy + donor_geno_mask.npy
-    run([PY, "extract_phi_condition.py"])          # real phi/condition/template/Q  -> data/
-    run([PY, "synth/extract_genotypes.py"])        # consensus donor genotypes      -> data/donor_geno*.npy
-    run([PY, "build_real_attr.py"])                # real allele->donor labels       -> attr_{val,test}
-    run([PY, "extract_size.py"])                   # real per-peak size(bp)          -> size_*
-    env = os.environ.copy()
-    env["STR_DATA_DIR"] = str(PROJ / "data"); env["STR_OUT_DIR"] = str(SRC)
-    run([PY, "make_insilico.py", "--build", "50000", "--noc_weights", "1,1.5,2.5,2", "--seed", "42"], env=env)
+    assert SRC == PROJ / "data_insilico_w", "--from-raw builds code/data_insilico_w; unset INSILICO_W"
+    run([PY, "preprocess.py"])
     print(f"[from-raw] built in-silico dataset -> {SRC}")
 
 
 def stage_prep_data_w():
-    """Copy the built dataset to a WRITABLE dir, carve the combo-disjoint DEV split, build tokens8."""
+    """Copy the built dataset to a WRITABLE dir and build tokens8."""
     assert (SRC / "meta_set.json").exists(), f"in-silico dataset not found at {SRC} (run with --from-raw first)"
     DATA_W.mkdir(parents=True, exist_ok=True)
     for f in SRC.glob("*.npy"):
@@ -72,14 +65,12 @@ def stage_prep_data_w():
             if cand.exists():
                 shutil.copy(cand, DATA_W / nm); break
     print(f"copied dataset -> {DATA_W}")
-    run([PY, "make_dev_split.py", str(DATA_W)])    # carve combo-disjoint balanced DEV (selection set)
-    run([PY, "features/enrich.py", str(DATA_W)])   # build tokens8_{train,val,test,open,dev}.npy
+    run([PY, "features/enrich.py", str(DATA_W)])   # build tokens8_{train,val,test,open}.npy
 
 
-def stage_train(seed, out_subdir, mask_private=0.0):
+def stage_train(seed, out_subdir):
     env = os.environ.copy(); env["STR_DATA_DIR"] = str(DATA_W)
-    run([PY, "train_set_transformer.py", "--seed", str(seed), "--out_subdir", out_subdir,
-         "--mask_private", str(mask_private)], env=env, cwd=HERE)
+    run([PY, "train_set_transformer.py", "--seed", str(seed), "--out_subdir", out_subdir], env=env, cwd=HERE)
 
 
 if __name__ == "__main__":
@@ -89,14 +80,12 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_subdir", type=str, default="inc22_fixed_aslot")
     ap.add_argument("--skip-prep", action="store_true",
-                    help="reuse an existing data_w_inc22/ (skip copy/dev-split/enrich)")
-    ap.add_argument("--mask_private", type=float, default=0.0,
-                    help="drop rate for single-carrier peaks during training (0.0 = original arm)")
+                    help="reuse an existing data_w_inc22/ (skip copy/enrich)")
     args = ap.parse_args()
 
     if args.from_raw:
         stage_raw_to_insilico()
     if not args.skip_prep:
         stage_prep_data_w()
-    stage_train(args.seed, args.out_subdir, args.mask_private)
+    stage_train(args.seed, args.out_subdir)
     print("\nDONE.")

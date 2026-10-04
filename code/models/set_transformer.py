@@ -10,12 +10,12 @@ This is a faithful, verbatim EXTRACTION of the single code path that
     n_token_feats = 8
     aux_heads   = True         (attr_head + phi_head; GSANet uses attr logits)
     set_of_set  = True         (private/shared split BEFORE the encoder)
-    feas_filter = True         (drop 0-carrier peaks before the encoder; dedicated reject pool)
+    feas_filter = True         (drop 0-carrier peaks before the encoder)
     n_slot_iters=3, ot_eps=0.05, ot_iters=5
 
-The COUNT (NOC) that is DECODED is the post-hoc RandomForest on the prob profile
-(posthoc_cardinality) — the CORN/noc_head_v2 output is never decoded (it collapses N3/N4,
-measured ~0.21/0.17). The CORN head itself IS present and trained (`noc_head_v2=True`), because
+The COUNT (NOC) comes from the AdaSlot gate (sum of gates, corrected by decode_layer.py); the
+CORN/noc_head_v2 output is never decoded (it collapses N3/N4, measured ~0.21/0.17). The CORN head
+itself IS present and trained (`noc_head_v2=True`), because
 the published arm trained with it: its inputs are detached so it cannot change the ranking, but
 its gradient DOES enter the global clip_grad_norm_ denominator, so removing it silently enlarges
 every other parameter's effective step.
@@ -25,8 +25,8 @@ decoders, geno_query, ref_match, em_phi_feature, noise_gate, soft_geno_attr, spa
 vib, mass_pool, vicreg, donor_recon, query_denoise, noc_contrast/noc_ord, sic, the unused
 `cardinality_head`, the `hybrid`/`pooled` heads, the decoder_source raw/local branches, …).
 
-BIT-IDENTICAL guarantee (verify_inc22.py): the parameter NAMES and the forward computation of the
-RANKING heads (logits_cls / logits_card / logits_attr / phi / logit_reject) match the original
+BIT-IDENTICAL guarantee (checked when it was extracted): the parameter NAMES and the forward computation of the
+RANKING heads (logits_cls / logits_card / logits_attr / phi) match the original
 `SetTransformerMixture` for the inc22 config, so the published checkpoint
 results/inc22_fixed_aslot_seed42/best_model.pt loads (strict=False — the checkpoint's extra keys are
 only the unused `cardinality_head.*`) and produces byte-identical outputs/loss/grad — including
@@ -201,7 +201,7 @@ class PMA(nn.Module):
 class MAB_softmax(nn.Module):
     """Plain LayerNorm MAB used only inside PMA (matches `MAB` in set_transformer.py; the PMA pool's
     `mab` submodule). Kept under this name purely for clarity — its parameter names (attn/ff/norm1/
-    norm2) match the original so the checkpoint's `pma.mab.*` / `pma_reject.mab.*` keys load."""
+    norm2) match the original so the checkpoint's `pma.mab.*` keys load."""
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
@@ -372,9 +372,8 @@ class SetTransformerMixture(nn.Module):
         self.encoder = nn.ModuleList(
             [ISABpp(d_model, n_heads, m_inducing, dropout) for _ in range(n_isab)])
 
-        # pooling: shared pool (z) + dedicated reject pool (feas_filter keeps reject seeing out-of-panel)
+        # pooling: shared pool (z)
         self.pma = PMA(d_model, n_heads, k_seeds=1, dropout=dropout)
-        self.pma_reject = PMA(d_model, n_heads, k_seeds=1, dropout=dropout)
 
         # aslot decoder + CoSA genotype buffers/projection (registered exactly as in the original)
         self.cls_decoder_module = AdaptiveSlotDecoder(
@@ -387,7 +386,6 @@ class SetTransformerMixture(nn.Module):
         self.geno_proj = nn.Linear(d_model, d_model)
         nn.init.zeros_(self.geno_proj.weight); nn.init.zeros_(self.geno_proj.bias)
 
-        self.reject_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, 1))
 
         # privileged aux heads (in-silico only): per-peak attribution + phi abundance
         self.attr_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes + 1))
@@ -462,16 +460,6 @@ class SetTransformerMixture(nn.Module):
         H = H_priv + H_shar                                           # disjoint -> clean selection
         return x0, H, pad_mask
 
-    def _reject_pool(self, tokens, mask):
-        """Reject pool from an UNFILTERED, plain single-pass encode, DETACHED before pooling — so the
-        open-set (out-of-panel) evidence feas_filter strips still reaches reject, and the reject
-        gradient never touches the encoder or the cls pool."""
-        x0u, pad_u = self._project_tokens(tokens, mask, apply_feas=False)
-        Hu = x0u
-        for isab in self.encoder:
-            Hu = isab(Hu, pad_mask=pad_u)
-        return self.pma_reject(Hu.detach(), pad_mask=pad_u).squeeze(1)
-
     def _mac_feats_torch(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """MAC/physical count features (PACE, Marciano & Adelman 2017; deepNoC 2024): per-locus allele
         counts at several RFU thresholds + global height stats. Fixed input feature (no grad). (B,19).
@@ -523,11 +511,9 @@ class SetTransformerMixture(nn.Module):
         slot_out = self.cls_decoder_module(H, pad_mask, geno_slots, attr_logits=attr_raw)
 
         z = self.pma(H, pad_mask=pad_mask).squeeze(1)
-        z_rej = self._reject_pool(tokens, mask)                       # feas_filter: unfiltered + detached
 
         out = {
             "logits_cls":   slot_out["logits_cls"],
-            "logit_reject": self.reject_head(z_rej),
             "logits_card":  slot_out["logits_card"],
             "logits_attr":  attr_raw,
             "phi":          F.softplus(self.phi_head(z)),
@@ -538,5 +524,6 @@ class SetTransformerMixture(nn.Module):
         # permutation-invariant slot aggregates, surfaced for a count head. Both are detached in the
         # decoder, so exposing them cannot alter the ID path.
         out["gate"] = slot_out["gate"]
+        out["gate_logit"] = slot_out["gate_logit"]          # the existence logit, read by decode_layer.py
         out["slot_mass"] = slot_out["slot_mass"]
         return out
