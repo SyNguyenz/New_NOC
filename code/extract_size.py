@@ -80,7 +80,7 @@ def main():
     print(f"data: {DATA}\nbuilding size lookup from raw CSVs ...")
     look = build_size_lookup()
     print(f"  samples with size: {len(look)}")
-    for split in ["train", "val", "test", "open", "dev"]:
+    for split in ["train", "val", "test", "open"]:
         tp = DATA / f"tokens_{split}.npy"
         npath = DATA / f"meta_sample_names_{split}.json"
         if not tp.exists() or not npath.exists():

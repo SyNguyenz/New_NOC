@@ -105,9 +105,9 @@ def extract_genotypes():
             continue
         donor_id = known_donors[int(pos[0])]
 
-        tokens = tokens_train[i]  # (160, 3)
-        valid  = mask_train[i]    # (160,)
-        for j in range(160):
+        tokens = tokens_train[i]  # (MAX_SEQ, 3)
+        valid  = mask_train[i]    # (MAX_SEQ,)
+        for j in range(len(valid)):
             if not valid[j]:
                 break
             locus_idx = int(round(tokens[j, 0]))
@@ -244,7 +244,7 @@ def qc_against_real(df: pd.DataFrame):
             # Check observed alleles in mixture
             toks  = tokens[i]
             valid = mask[i]
-            for j in range(160):
+            for j in range(len(valid)):
                 if not valid[j]:
                     break
                 locus_idx = int(round(toks[j, 0]))

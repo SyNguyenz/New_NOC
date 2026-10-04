@@ -1,114 +1,76 @@
-# `inc22_clean` — clean, standalone pipeline for `inc22_fixed_aslot`
+# STR mixture contributor identification (NOC + who)
 
-A self-contained slice of the project that runs **only** the `inc22_fixed_aslot` arm, raw → output,
-without the 60-arm orchestrator, the flag zoo, or the ~2200-line train/model files. The training +
-model are a **verified bit-identical extraction** of the inc22 path; the data generators are the
-proven shared scripts, invoked unchanged.
+Raw PROVEDIt GlobalFiler profiles → the number of contributors and which reference donors they are.
 
 ## Pipeline (raw → output)
 
 ```
-data_raw/  (PROVEDIt CSVs)
-   │  extract_phi_condition.py · synth/extract_genotypes.py · build_real_attr.py · extract_size.py   [proven, invoked]
+data_raw/  (PROVEDIt CSVs + known genotypes)
+   │  preprocess.py: prepare/size pass · build_donor_geno · extract_phi_condition · synth/extract_genotypes ·
+   │                 build_real_attr · features/enrich · calibrate_*.py (NOC1 → data/*.json)
    ▼
-data/  (real phi/condition, donor genotypes, allele→donor attr, per-peak size)
-   │  make_insilico.py --build 50000 --noc_weights 1,1.5,2.5,2 --seed 42                              [proven, invoked]
+data/  (real arrays + the generator's calibrated laws)
+   │  make_insilico.py --build 50000 --noc_weights 1,1.5,2.5,2 --seed 42     (conditioned draws; writes gen_law.npy)
    ▼
-data_insilico_w/  (tokens/mask/Xflat/y/noc + phi/attr/size for val/test)
-   │  copy → data_w_inc22/ ; make_dev_split.py ; features/enrich.py                                  [proven, invoked]
+data_insilico_w/  (in-silico train + real val/test/open)
+   │  features/enrich.py                                                      (kaggle_run_increment1.py does this)
    ▼
-data_w_inc22/  (tokens8_{train,val,test,open,dev} + dev split)
-   │  train_set_transformer.py   ── model: models/set_transformer.py  (CLEAN REWRITE)                               [clean]
+train_set_transformer.py   model: models/set_transformer.py   decode: decode_layer.py
    ▼
-results/inc22_fixed_aslot_seed42/  {best_model.pt, metrics.json, y_test_pred.npy, y_test_true.npy}
+results/<out_subdir>_seed<seed>/  {best_model.pt, last_model.pt, metrics.json, y_test_pred.npy, y_test_true.npy}
 ```
 
 ## Run
 
 ```bash
-# from the project root
-python inc22_clean/kaggle_run_increment1.py --from-raw --seed 42      # full chain from the PROVEDIt CSVs
-python inc22_clean/kaggle_run_increment1.py --seed 42                 # from an already-built data_insilico_w (common)
-python inc22_clean/kaggle_run_increment1.py --skip-prep --seed 42     # reuse an existing data_w_inc22/
-
-# train directly (data dir already prepared):
-STR_DATA_DIR=<data_w_dir> python inc22_clean/train_set_transformer.py --seed 42 --out_subdir inc22_fixed_aslot
-
-# prove the clean model == the original inc22 path on the published checkpoint:
-python inc22_clean/verify_inc22.py
+bash preprocess.sh 0                                                  # raw -> data/fold0 (see RUN_10FOLD.md)
+INSILICO_W=data/fold0 python code/kaggle_run_increment1.py --seed 42  # enrich + train + decode
+STR_DATA_DIR=<data_dir> python code/train_set_transformer.py --seed 42 --out_subdir <name>
+STR_INIT_FROM=<ckpt> STR_EPOCHS=3 STR_LR=1e-4 ...                    # fine-tune
+STR_EVAL_ONLY=1 STR_INIT_FROM=<ckpt> STR_DATA_DIR=<data_dir> ...     # decode/evaluate a checkpoint only
 ```
 
-## What the model is (fixed — no flags)
+Environment: `STR_DATA_DIR`, `STR_DEVICE` (cpu/cuda/mps), `STR_BATCH` (256 = recipe; 128 on a 4 GB card),
+`STR_EPOCHS`, `STR_LR`, `STR_INIT_FROM`, `STR_EVAL_ONLY` (`STR_FOLD` is set by preprocess.sh).
 
-`models/set_transformer.py :: SetTransformerMixture` — the inc22 configuration, hard-wired:
+## Model (`models/set_transformer.py`)
 
 | component | choice |
 |---|---|
-| encoder | ISAB++ (SetNorm, clean-path), `nc_attn = mab0` → mab0 = non-competitive **SigmoidMABpp**, mab1 = **MABpp** |
-| token embed | **periodic** PLR (Gorishniy 2022), `sigma=0.3`, 8-field tokens |
-| pre-encoder | **set_of_set** (private/shared split) + **feas_filter** (drop 0-carrier peaks; dedicated reject pool) |
-| decoder | **AdaptiveSlot**: CoSA geno-init → GSANet attr-refine → MESH Sinkhorn-OT loop (`iters=3, eps=0.05, ot_iters=5`) → AdaSlot Gumbel-Sigmoid gate |
-| count | **post-hoc RandomForest** on the prob profile (NOT a learned head — CORN/noc_head_v2 excluded) |
-| aux (train only) | per-peak attribution (`soft_attr_label` = EuroForMix φ·CN soft CE) + φ regression, Kendall-weighted |
+| encoder | ISAB++ (SetNorm), `nc_attn = mab0` (SigmoidMABpp / MABpp) |
+| token embed | periodic PLR (`sigma=0.3`), 8-field tokens |
+| pre-encoder | set_of_set (private/shared split) + feas_filter (drop 0-carrier peaks) |
+| decoder | AdaptiveSlot: CoSA genotype init → GSANet attribution refine → MESH Sinkhorn-OT loop → AdaSlot gate |
+| count | the AdaSlot gate: k = round(Σ gate), corrected by the decode layer |
+| aux (train only) | per-peak attribution (generator's true split where known) + φ regression, Kendall-weighted |
 
-## Training objective
+Objective (closed set only; the open split is never trained on): `ASL(γ_neg=4)` on `logits_cls` + `0.05·SmoothL1(Σgate, NOC)`
++ `0.3·CORN(logits_count_v2, NOC)` (trained, never decoded) + `Kendall(attr CE + L1 φ)`; `mask_peaks=0.15` on
+shared peaks. Selection = macro-over-NOC oracle Recall@k on val (real NOC1 val + 15% of the in-silico combos, held out); no early stopping.
 
-`ASL(γ_neg=4)` on `logits_cls` + `0.5·BCE(reject)` + `0.3·CE(logits_card, EM-optimal-k)`
-+ `Kendall(soft_attr CE + L1 φ)`, with `mask_peaks=0.15` (drop shared peaks only, never a minor's
-private/single-carrier peak). Selection = macro-over-NOC oracle Recall@k on the in-silico **DEV** split.
+## Decode (`decode_layer.py`) — every parameter chosen on val
 
-## Decode
+1. **Penalty + bonus on the gate**, over all donors:
+   - penalty: `u_c` = largest single-peak share of the positive contributions to c's gate (gradient × input);
+     if `u_c ≥ u_min`, that peak anchors c's level and `p_c` = how plausible c's other alleles are next to the
+     majors; `logit_c -= a · u_c · (1 − p_c)`.
+   - bonus: `f2_c` = c's proportion in a joint fit with the majors relative to the weakest (filter `f2 ≥ f2_min`),
+     `f1_c` = allele coverage beyond the sample's background, `f3_c` = relative gate;
+     `logit_c += b · max(f1_c, .05) · f2_c · f3_c`.
+   - k = round(Σ corrected gate).
+2. **Order**: set-conditional greedy on the phi-reranked logits (`phi_rerank.py`), each pick scored by what it
+   newly explains (height over the profile median, per allele).
+3. **Drop**: the k-th pick is dropped when it explains ≤ t.
+4. **Open score** (a donor outside the panel?): attr background share, off-panel height, height the decoded set leaves
+   unexplained, gate total, 6th gate, weakness of the k-th gate; each standardised on val, summed one-sided
+   (excess in the open direction only), flagged above the 95th percentile of val.
 
-1. **phi-rerank** (`phi_rerank.py`): independent EM mixture-proportion (Mx) deconvolution → logarithmic-
-   opinion-pool rerank of the per-donor logits, `alpha` tuned on val. Reranks the **ranking** (which
-   donors / decode order) only.
-2. **COUNT = post-hoc RandomForest on the PROB profile** (`posthoc_cardinality`, the original inc22
-   count). **NOT count-on-rerank**: counting on the LOP-reranked score ("lop count") trades N3/N4 down
-   for N5 — measured on inc22's real test, N3 0.917→0.784 (−13pp), N4 0.930→0.860 (−7pp) for N5
-   +8pp. The learned CORN head (noc_head_v2) is likewise **excluded** — it collapses N3/N4 (~0.21/0.17).
-3. decode top-`k_post` of the reranked ranking; `oracle` = top-true-k of the reranked ranking (ceiling).
+## Fold 0 result (`results/dgw_ref_seed42`)
 
-`metrics.json` reports `per_noc_oracle` (test ceiling, reranked), `per_noc_at_pred_k` (deployed),
-`count_source` (`posthoc_rf` needs labelled real mixtures, `tierA` is synth-fit),
-`dev_per_noc_oracle` (combo-generalization judge), `phi_rerank_alpha`, `count_acc`, `reject_auroc`.
+v3 (`../results/inc22_v3_seed42`, 150 epochs) fine-tuned 3 epochs on `data_dgw` (12k, seed 7), decode as above
+(chosen then on the old in-silico DEV split: α .2, t .0299, u_min .1, a 16, f2_min .3, b 32):
 
-## Excluded (everything inc22 does not use / what was measured-bad)
-
-replicates, em_phi_feature, noise_gate, ref_match, soft_geno_attr, phi_inject, sparse_attn,
-minor_weight, irm, vicreg, donor_recon, query_denoise, mass_pool, noc_contrast / noc_ord_head, sic,
-the per_donor / additive / dsmil / sos / spen / pooled / hybrid decoders, geno_query, the
-`decoder_source raw/local` branches, the unused `cardinality_head`, and the **CORN count head**
-(`ord_count_head` / noc_head_v2 + its slot-mass/MAC features) — CORN collapses N3/N4, and it fed only
-DETACHED features so dropping it leaves the ranking byte-identical. Count-on-rerank is also excluded
-(trades N3/N4). Count is post-hoc RF on probs.
-
-## Bit-identical proof (`verify_inc22.py`)
-
-Loads `results/inc22_fixed_aslot_seed42/best_model.pt` into **both** the original
-(project-root `models/set_transformer.py`) `SetTransformerMixture` built with the inc22 kwargs **and**
-the clean (`inc22_clean/models/set_transformer.py`) `SetTransformerMixture`, runs the same test batch
-in `eval()`, and asserts identical outputs + gradients. Measured:
-
-```
-original load: missing=[] unexpected=[]          # inc22 kwargs reproduce the exact architecture
-clean    load: missing=[] unexpected=[cardinality_head.*, ord_count_head.*]   # unused + excluded-CORN heads
-forward  max|Δ| = 0.000e+00  on logits_cls / logits_card / phi / logits_attr / logit_reject
-grads    max|Δ| = 0.000e+00  over all 135 shared parameters
-PASS — clean SetTransformerMixture is bit-identical to the inc22 path.
-```
-
-### Reproducibility note (honest scope of "bit-identical")
-The clean model computes the **exact same function and gradients** as the original inc22 path — proven
-by loading the published checkpoint into both (above). It therefore reproduces the published
-`inc22_fixed_aslot_seed42` result exactly from that checkpoint. A *from-scratch* retrain with the clean
-pipeline trains the identical architecture/objective on the identical data and is internally
-reproducible (fixed seed), but its bit-level weights will differ from the original seed-42 run because
-removing the unused `cardinality_head` shifts the random-init stream (the dropped head consumed RNG
-during construction in the original). The decode also now uses the deployable phi-rerank→count recipe,
-so retrained `metrics.json` numbers reflect that recipe, not the bare inc22 arm's count-on-raw-probs.
-
-## Data generators are invoked, not rewritten
-`extract_*`, `make_insilico.py`, `make_dev_split.py`, `features/enrich.py` define the exact in-silico
-dataset; they are shared (not arm-specific) and not the source of the complexity, so they are invoked
-unchanged from the project root. Rewriting them would change the generated data and break
-reproducibility. The clean rewrite is the training + model, where the bloat actually lived.
+| | macro ID (NOC2-5) | macro count | NOC2 | NOC3 | NOC4 | NOC5 |
+|---|---|---|---|---|---|---|
+| in-silico DEV (old split) | .873 | | | | | |
+| real test | .933 | .950 | .961 | .974 | .967 | .828 |

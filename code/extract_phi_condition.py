@@ -137,7 +137,7 @@ def parse_condition(name: str, n_contrib: int) -> tuple[str, str, float]:
 
 def main():
     print(f"data dir: {DATA}")
-    for split in ["train", "val", "test", "open", "dev"]:
+    for split in ["train", "val", "test", "open"]:
         npath = DATA / f"meta_sample_names_{split}.json"
         if not npath.exists():
             continue

@@ -84,27 +84,20 @@ if __name__ == "__main__":
     # though the model's feas_filter drops those peaks later. Measured on real test: filtering the
     # no-panel peaks BEFORE enrichment is worth +0.048 macro-over-NOC recall on its own. Real data is
     # 23% no-panel peaks vs 3.5% in-silico, so this also removes a train/test asymmetry.
-    # STR_ENRICH_AFTER_FEAS=0 restores the old order.
-    after_feas = int(os.environ.get("STR_ENRICH_AFTER_FEAS", "1"))
     dg = dgm = None
-    if after_feas:
-        for cand in (D / "donor_geno.npy", D.parent / "data" / "donor_geno.npy"):
-            if cand.exists():
-                dg = np.load(cand); dgm = np.load(cand.parent / "donor_geno_mask.npy"); break
-        if dg is None:
-            print("WARN: donor_geno not found -> enriching on the UNFILTERED peak set (old order)")
-            after_feas = 0
-    for sp in ["train", "val", "test", "open", "dev"]:
+    for cand in (D / "donor_geno.npy", D.parent / "data" / "donor_geno.npy"):
+        if cand.exists():
+            dg = np.load(cand); dgm = np.load(cand.parent / "donor_geno_mask.npy"); break
+    if dg is None:
+        raise SystemExit(f"donor_geno.npy not found next to {D} or in {D.parent / 'data'}")
+    for sp in ["train", "val", "test", "open"]:
         if not (D / f"tokens_{sp}.npy").exists():
             continue
         tok = np.load(D / f"tokens_{sp}.npy"); mk = np.load(D / f"mask_{sp}.npy")
-        if after_feas:
-            fm = feasible_mask(tok, mk, dg, dgm)
-            kept = fm.sum() / max(mk.astype(bool).sum(), 1)
-            en = enrich_tokens(tok, fm)                      # features from the FEASIBLE set only
-            print(f"  {sp}: enrich-after-feas keeps {kept:.3f} of peaks for feature computation")
-        else:
-            en = enrich_tokens(tok, mk)                      # (N, S, 9)
+        fm = feasible_mask(tok, mk, dg, dgm)
+        kept = fm.sum() / max(mk.astype(bool).sum(), 1)
+        en = enrich_tokens(tok, fm)                          # features from the FEASIBLE set only
+        print(f"  {sp}: enrich-after-feas keeps {kept:.3f} of peaks for feature computation")
         np.save(D / f"tokens8_{sp}.npy", en[:, :, :8])       # 8-field slice (Increment 1 token)
         print(f"{sp}: {en.shape} -> tokens8_{sp}.npy")
         if sp == "test":

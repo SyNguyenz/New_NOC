@@ -10,12 +10,12 @@ This is a faithful, verbatim EXTRACTION of the single code path that
     n_token_feats = 8
     aux_heads   = True         (attr_head + phi_head; GSANet uses attr logits)
     set_of_set  = True         (private/shared split BEFORE the encoder)
-    feas_filter = True         (drop 0-carrier peaks before the encoder; dedicated reject pool)
+    feas_filter = True         (drop 0-carrier peaks before the encoder)
     n_slot_iters=3, ot_eps=0.05, ot_iters=5
 
-The COUNT (NOC) that is DECODED is the NoC LoRA (enable_noc_lora: a count-only second pass the ID
-pass never reads) — the CORN/noc_head_v2 output is never decoded (it collapses N3/N4,
-measured ~0.21/0.17). The CORN head itself IS present and trained (`noc_head_v2=True`), because
+The COUNT (NOC) comes from the AdaSlot gate (sum of gates, corrected by decode_layer.py); the
+CORN/noc_head_v2 output is never decoded (it collapses N3/N4, measured ~0.21/0.17). The CORN head
+itself IS present and trained (`noc_head_v2=True`), because
 the published arm trained with it: its inputs are detached so it cannot change the ranking, but
 its gradient DOES enter the global clip_grad_norm_ denominator, so removing it silently enlarges
 every other parameter's effective step.
@@ -25,8 +25,8 @@ decoders, geno_query, ref_match, em_phi_feature, noise_gate, soft_geno_attr, spa
 vib, mass_pool, vicreg, donor_recon, query_denoise, noc_contrast/noc_ord, sic, the unused
 `cardinality_head`, the `hybrid`/`pooled` heads, the decoder_source raw/local branches, …).
 
-BIT-IDENTICAL guarantee (verify_inc22.py): the parameter NAMES and the forward computation of the
-RANKING heads (logits_cls / logits_card / logits_attr / phi / logit_reject) match the original
+BIT-IDENTICAL guarantee (checked when it was extracted): the parameter NAMES and the forward computation of the
+RANKING heads (logits_cls / logits_card / logits_attr / phi) match the original
 `SetTransformerMixture` for the inc22 config, so the published checkpoint
 results/inc22_fixed_aslot_seed42/best_model.pt loads (strict=False — the checkpoint's extra keys are
 only the unused `cardinality_head.*`) and produces byte-identical outputs/loss/grad — including
@@ -38,7 +38,6 @@ Classes/functions copied verbatim from models/set_transformer.py:
 """
 from __future__ import annotations
 
-import copy
 import math
 
 import torch
@@ -202,7 +201,7 @@ class PMA(nn.Module):
 class MAB_softmax(nn.Module):
     """Plain LayerNorm MAB used only inside PMA (matches `MAB` in set_transformer.py; the PMA pool's
     `mab` submodule). Kept under this name purely for clarity — its parameter names (attn/ff/norm1/
-    norm2) match the original so the checkpoint's `pma.mab.*` / `pma_reject.mab.*` keys load."""
+    norm2) match the original so the checkpoint's `pma.mab.*` keys load."""
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
@@ -237,7 +236,7 @@ def sinkhorn_log(affinity: torch.Tensor, pad_mask: torch.Tensor,
 class AdaptiveSlotDecoder(nn.Module):
     """Slots = panel donors (K=45).  CoSA geno init -> GSANet attr-guided refine -> MESH Sinkhorn-OT
     slot-attention loop -> AdaSlot Gumbel-Sigmoid existence gate.  logits_cls = cls_head(slots) +
-    gate_logit; logits_card = noc_head(gate); slot_mass (detached) feeds the CORN head only."""
+    gate_logit; logits_card = noc_head(gate).  (The CORN slot-mass count signal is excluded — see header.)"""
 
     def __init__(self, d_model: int, n_classes: int = 45, n_noc: int = 5,
                  n_iters: int = 3, ot_eps: float = 0.05, ot_iters: int = 5,
@@ -338,8 +337,9 @@ class AdaptiveSlotDecoder(nn.Module):
 class SetTransformerMixture(nn.Module):
     """`inc22_fixed_aslot` model.  Fixed architecture (no flag zoo).  Parameter names match the
     original SetTransformerMixture for the inc22 config so the published checkpoint loads (strict=False:
-    the checkpoint key absent here is the UNUSED `cardinality_head.*`).  CORN (noc_head_v2) is trained
-    but never decoded — it collapses N3/N4 (measured); the count is the NoC LoRA (enable_noc_lora)."""
+    the checkpoint keys absent here are the UNUSED `cardinality_head.*` and the EXCLUDED CORN count head
+    `ord_count_head.*`).  CORN (noc_head_v2) is excluded by design — it collapses N3/N4 (measured); the
+    count is post-hoc RandomForest on the prob profile."""
 
     _AOFF = 30   # round(allele*10)+OFF -> allele-bin index (matches the trainer's ALLELE_OFF)
 
@@ -372,9 +372,8 @@ class SetTransformerMixture(nn.Module):
         self.encoder = nn.ModuleList(
             [ISABpp(d_model, n_heads, m_inducing, dropout) for _ in range(n_isab)])
 
-        # pooling: shared pool (z) + dedicated reject pool (feas_filter keeps reject seeing out-of-panel)
+        # pooling: shared pool (z)
         self.pma = PMA(d_model, n_heads, k_seeds=1, dropout=dropout)
-        self.pma_reject = PMA(d_model, n_heads, k_seeds=1, dropout=dropout)
 
         # aslot decoder + CoSA genotype buffers/projection (registered exactly as in the original)
         self.cls_decoder_module = AdaptiveSlotDecoder(
@@ -387,7 +386,6 @@ class SetTransformerMixture(nn.Module):
         self.geno_proj = nn.Linear(d_model, d_model)
         nn.init.zeros_(self.geno_proj.weight); nn.init.zeros_(self.geno_proj.bias)
 
-        self.reject_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, 1))
 
         # privileged aux heads (in-silico only): per-peak attribution + phi abundance
         self.attr_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes + 1))
@@ -406,78 +404,6 @@ class SetTransformerMixture(nn.Module):
             self.ord_count_head = nn.Sequential(
                 nn.Linear(_ocin, 64), nn.ReLU(inplace=True),
                 nn.Dropout(dropout), nn.Linear(64, 4))
-
-    # ── NoC LoRA: count-only low-rank adaptation of the SAME weights ───────────────────────
-    # Every 2-D weight W on the count path gets W + B·A, but ONLY inside the NoC pass. The ID pass
-    # (logits_cls, logit_reject) never reads A or B, so ID is unchanged by construction. B starts at
-    # zero, so a freshly enabled LoRA reproduces the backbone's own count path exactly. Chosen
-    # 2026-09-11 over a full clone and two adapter placements by a rule fixed before the run
-    # (5 seeds, deepNoC protocol: macro F1 0.9505 ± 0.003). The target list below reproduces that
-    # arm's 33 matrices: encoder, input/geno/attr projections and the slot decoder.
-    _NOC_LORA_SKIP = ("pma.", "pma_reject.", "reject_head.", "phi_head.", "ord_count_head.",
-                      "cls_decoder_module.cls_head.", "cls_decoder_module.noc_head.",
-                      "locus_embed.", "num_embed.", "noc_lora.")
-
-    # Where the count-only adaptation may sit. "all" is the 33 matrices of the 2026-09-11 arm;
-    # the narrower scopes exist to ask WHERE the count actually needs to change the network, with the
-    # loss still coming from the count head at the decoder and back-propagating into the encoder.
-    _NOC_LORA_SCOPES = {
-        "all": lambda n: True,
-        "encoder": lambda n: n.startswith("encoder."),
-        "encoder_attn": lambda n: n.startswith("encoder.") and (".attn." in n or n.split(".")[-2]
-                                                                in ("wq", "wk", "wv", "wo")),
-        "decoder": lambda n: n.startswith("cls_decoder_module."),
-    }
-
-    def enable_noc_lora(self, rank: int = 8, scope: str = "all") -> "SetTransformerMixture":
-        """Attach the NoC LoRA (idempotent). Call BEFORE load_state_dict for a checkpoint that
-        carries noc_lora.* keys; old checkpoints without them load unchanged.
-        `scope` restricts which matrices get W + B·A (see _NOC_LORA_SCOPES)."""
-        if getattr(self, "noc_lora", None) is not None:
-            return self
-        if scope not in self._NOC_LORA_SCOPES:
-            raise ValueError(f"scope {scope!r} not in {sorted(self._NOC_LORA_SCOPES)}")
-        keep = self._NOC_LORA_SCOPES[scope]
-        params = dict(self.named_parameters())
-        names = [n for n, p in params.items()
-                 if p.dim() == 2 and not n.startswith(self._NOC_LORA_SKIP) and keep(n)]
-        lora = nn.Module()
-        lora.A = nn.ParameterDict()
-        lora.B = nn.ParameterDict()
-        for n in names:
-            p = params[n]
-            key = n.replace(".", "__")
-            a = torch.empty(rank, p.shape[1], device=p.device, dtype=p.dtype)
-            nn.init.kaiming_uniform_(a, a=5 ** 0.5)
-            lora.A[key] = nn.Parameter(a)
-            lora.B[key] = nn.Parameter(torch.zeros(p.shape[0], rank, device=p.device, dtype=p.dtype))
-        lora.head = copy.deepcopy(self.cls_decoder_module.noc_head)
-        lora.names = names
-        lora.rank = rank
-        lora.scope = scope
-        self.noc_lora = lora
-        return self
-
-    def _noc_gate(self, tokens, mask):
-        """Count path of forward(): encode_set -> geno slots -> attr -> slot decoder. Returns the
-        decoder dict (gate AND logits_cls of this pass) so a count head can read both."""
-        _, H, pad_mask = self._encode_set(tokens, mask)
-        geno = self._encode_geno().unsqueeze(0).expand(tokens.size(0), -1, -1)
-        return self.cls_decoder_module(H, pad_mask, geno, attr_logits=self.attr_head(H))
-
-    def noc_pass(self, tokens, mask):
-        """The LoRA-adapted count pass as a dict (gate, logits_cls, ...). The ID outputs of the model
-        are produced by forward() without the LoRA, so nothing here can move them."""
-        lora = getattr(self, "noc_lora", None)
-        if lora is None:
-            raise RuntimeError("noc_pass needs enable_noc_lora() first")
-        params = dict(self.named_parameters())
-        delta = {n: params[n] + lora.B[n.replace(".", "__")] @ lora.A[n.replace(".", "__")]
-                 for n in lora.names}
-        return torch.func.functional_call(self, delta, (tokens, mask), {"_noc_pass": True})
-
-    def _noc_logits(self, tokens, mask):
-        return self.noc_lora.head(self.noc_pass(tokens, mask)["gate"])
 
     # ── token projection (with feas_filter) ──────────────────────────────────
     def _project_tokens(self, tokens, mask, apply_feas: bool = True):
@@ -534,16 +460,6 @@ class SetTransformerMixture(nn.Module):
         H = H_priv + H_shar                                           # disjoint -> clean selection
         return x0, H, pad_mask
 
-    def _reject_pool(self, tokens, mask):
-        """Reject pool from an UNFILTERED, plain single-pass encode, DETACHED before pooling — so the
-        open-set (out-of-panel) evidence feas_filter strips still reaches reject, and the reject
-        gradient never touches the encoder or the cls pool."""
-        x0u, pad_u = self._project_tokens(tokens, mask, apply_feas=False)
-        Hu = x0u
-        for isab in self.encoder:
-            Hu = isab(Hu, pad_mask=pad_u)
-        return self.pma_reject(Hu.detach(), pad_mask=pad_u).squeeze(1)
-
     def _mac_feats_torch(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """MAC/physical count features (PACE, Marciano & Adelman 2017; deepNoC 2024): per-locus allele
         counts at several RFU thresholds + global height stats. Fixed input feature (no grad). (B,19).
@@ -583,15 +499,8 @@ class SetTransformerMixture(nn.Module):
             sm = probs.new_zeros(probs.size(0), m)
         return self.ord_count_head(torch.cat([pp, mac, sm], dim=1))                    # (B, 4)
 
-    def forward(self, tokens: torch.Tensor, mask: torch.Tensor, noc_only: bool = False,
-                _noc_pass: bool = False) -> dict[str, torch.Tensor]:
-        """inc22 forward = the _forward_aslot path of SetTransformerMixture.
-        With enable_noc_lora(): also returns logits_noc (B,5) from a second, LoRA-adapted pass.
-        noc_only=True runs the NoC pass alone (training the LoRA); _noc_pass is internal."""
-        if _noc_pass:
-            return self._noc_gate(tokens, mask)
-        if noc_only:
-            return {"logits_noc": self._noc_logits(tokens, mask)}
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> dict[str, torch.Tensor]:
+        """inc22 forward = the _forward_aslot path of SetTransformerMixture (CORN/noc_head_v2 excluded)."""
         x0, H, pad_mask = self._encode_set(tokens, mask)
         B = tokens.size(0)
 
@@ -602,11 +511,9 @@ class SetTransformerMixture(nn.Module):
         slot_out = self.cls_decoder_module(H, pad_mask, geno_slots, attr_logits=attr_raw)
 
         z = self.pma(H, pad_mask=pad_mask).squeeze(1)
-        z_rej = self._reject_pool(tokens, mask)                       # feas_filter: unfiltered + detached
 
         out = {
             "logits_cls":   slot_out["logits_cls"],
-            "logit_reject": self.reject_head(z_rej),
             "logits_card":  slot_out["logits_card"],
             "logits_attr":  attr_raw,
             "phi":          F.softplus(self.phi_head(z)),
@@ -617,7 +524,6 @@ class SetTransformerMixture(nn.Module):
         # permutation-invariant slot aggregates, surfaced for a count head. Both are detached in the
         # decoder, so exposing them cannot alter the ID path.
         out["gate"] = slot_out["gate"]
+        out["gate_logit"] = slot_out["gate_logit"]          # the existence logit, read by decode_layer.py
         out["slot_mass"] = slot_out["slot_mass"]
-        if getattr(self, "noc_lora", None) is not None:          # second pass, after ID is fixed
-            out["logits_noc"] = self._noc_logits(tokens, mask)
         return out
