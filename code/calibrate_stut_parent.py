@@ -46,6 +46,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import kit
 
 HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("STR_DATA_DIR", str(HERE / "data")))
@@ -54,7 +55,8 @@ os.environ.setdefault("STR_DATA_DIR", str(DATA))
 _s = importlib.util.spec_from_file_location("make_insilico", HERE / "make_insilico.py")
 MI = importlib.util.module_from_spec(_s); _s.loader.exec_module(MI)
 
-RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+# RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 OFFS = (-10, 10, -20)                                       # n-1, n+1, n-2
 # Offsets, in REPEAT units, at which an allele can put something that is not floor: stutter at -3..+3 repeats and
 # the 1-3 bp artefacts (+-0.25/0.5/0.75 repeat). Kept in repeat units, not in the allele-name keys of _OFF_TARGET: a

@@ -36,6 +36,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import kit
 
 HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("STR_DATA_DIR", str(HERE / "data")))
@@ -45,7 +46,8 @@ os.environ.setdefault("STR_DATA_DIR", str(DATA))
 _s = importlib.util.spec_from_file_location("make_insilico", HERE / "make_insilico.py")
 MI = importlib.util.module_from_spec(_s); _s.loader.exec_module(MI)
 
-RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+# RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 BRIGHT = 800.0
 MIN_N = 8
 

@@ -33,6 +33,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import kit
 
 HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("STR_DATA_DIR", str(HERE / "data")))
@@ -42,7 +43,8 @@ _s = importlib.util.spec_from_file_location("make_insilico", HERE / "make_insili
 MI = importlib.util.module_from_spec(_s); _s.loader.exec_module(MI)
 import calibrate as CAL                                     # noqa: E402  (pull_neighbours, the edge grids)
 
-RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+# RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 H_EDGES = [200.0, 600.0, 1500.0, 4000.0, 1e12]              # the causing peak's height
 D_EDGES = [0.0, 0.5, 1.0, 2.0]                              # |distance| in bp
 MIN_N = 40

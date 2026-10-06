@@ -14,6 +14,7 @@ import glob, json
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import kit
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -36,8 +37,10 @@ def allele_to_float(s: str):
 
 
 def main():
-    f = glob.glob("data_raw/**/PROVEDIt_RD14-0003 GF Known Genotypes.xlsx", recursive=True)[0]
-    df = pd.read_excel(f, sheet_name=0)
+    # f = glob.glob("data_raw/**/PROVEDIt_RD14-0003 GF Known Genotypes.xlsx", recursive=True)[0]
+    f = glob.glob(f"data_raw/**/{kit.GENO_FILE}", recursive=True)[0]
+    # df = pd.read_excel(f, sheet_name=0)
+    df = pd.read_excel(f, sheet_name=0) if f.endswith(".xlsx") else pd.read_csv(f)
     loci_cols = [c for c in df.columns if c in LOCUS_TO_IDX]
 
     per_donor: dict[int, list[tuple[float, float]]] = {}

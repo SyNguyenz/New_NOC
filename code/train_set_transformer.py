@@ -2,11 +2,11 @@
 train_set_transformer.py — trainer + test-time decode for the set-transformer contributor model.
 
   * model  = SetTransformerMixture (CoSA+GSANet+MESH+AdaSlot, isab++/nc_mab0, periodic embed, aux heads,
-             set_of_set, feas_filter)
+             set_of_set, feas_filter). See models/set_transformer.py.
   * loss   = ASL(gamma_neg=4) on logits_cls
              + 0.05 * SmoothL1(sum gate, NOC)                   (the live AdaSlot slots ARE the count)
              + 0.3 * CORN(noc_head_v2)                          (detached inputs; trained, never decoded)
-             + Kendall( soft_attr_label CE  +  L1 phi )         (aux_heads, soft_attr_label)
+             + Kendall( soft_attr_label CE )                    (aux_heads, soft_attr_label)
   * train aug = mask_peaks 0.15 on shared peaks (private peaks are never masked)
   * selection = macro-over-NOC oracle Recall@k on the val split. No early stopping;
                 best_model.pt = best DEV epoch, last_model.pt = final epoch.
@@ -26,7 +26,6 @@ Writes results/<out_subdir>_seed<seed>/{best_model.pt, last_model.pt, metrics.js
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -98,6 +97,8 @@ CFG = {
 INIT_FROM = os.environ.get("STR_INIT_FROM", "").strip()
 # STR_EVAL_ONLY=1: no training - load STR_INIT_FROM and run the test-time decode/eval exactly as after training.
 EVAL_ONLY = os.environ.get("STR_EVAL_ONLY", "0") == "1"
+if (DATA_DIR / "meta_set.json").exists():
+    CFG["n_loci"] = len(json.load(open(DATA_DIR / "meta_set.json"))["loci"])
 CFG["epochs"] = int(os.environ.get("STR_EPOCHS", CFG["epochs"]))
 CFG["lr"] = float(os.environ.get("STR_LR", CFG["lr"]))
 # STR_BATCH: 256 is the trained recipe; a 4 GB card needs 128 (256 spills out of VRAM at MAX_SEQ 224).
@@ -221,13 +222,16 @@ def evaluate_oracle_em(model, loader):
 # ── owner_lut / cn_lut (carrier + copy-number LUTs from reference genotypes) ──
 def build_luts(donor_geno, donor_geno_mask, n_cls):
     gg = donor_geno; gm = donor_geno_mask.bool()
-    owner = torch.zeros(24, LUT_W, n_cls)
-    cn = torch.zeros(24, LUT_W, n_cls)
+    # owner = torch.zeros(24, LUT_W, n_cls)
+    owner = torch.zeros(CFG["n_loci"], LUT_W, n_cls)
+    # cn = torch.zeros(24, LUT_W, n_cls)
+    cn = torch.zeros(CFG["n_loci"], LUT_W, n_cls)
     for c in range(min(n_cls, gg.size(0))):
         for j in range(gg.size(1)):
             if gm[c, j]:
                 li = int(gg[c, j, 0]); ab = int(round(float(gg[c, j, 1]) * 10)) + ALLELE_OFF
-                if 0 <= li < 24 and 0 <= ab < LUT_W:
+                # if 0 <= li < 24 and 0 <= ab < LUT_W:
+                if 0 <= li < CFG["n_loci"] and 0 <= ab < LUT_W:
                     owner[li, ab, c] = 1.0
                     cn[li, ab, c] += 1.0                       # accumulate: 2 for homozygous
     return owner, cn
@@ -285,18 +289,20 @@ def train(seed: int, out_subdir: str):
     noc_v2_w = float(cfg["noc_v2_weight"])
     # Kendall homoscedastic-uncertainty weights for the privileged aux losses
     log_var_attr = torch.zeros((), device=DEVICE, requires_grad=True)
-    log_var_phi  = torch.zeros((), device=DEVICE, requires_grad=True)
+    # log_var_phi  = torch.zeros((), device=DEVICE, requires_grad=True)
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                                   lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    optimizer.add_param_group({"params": [log_var_attr, log_var_phi], "weight_decay": 0.0})
+    # optimizer.add_param_group({"params": [log_var_attr, log_var_phi], "weight_decay": 0.0})
+    optimizer.add_param_group({"params": [log_var_attr], "weight_decay": 0.0})
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
                                                            patience=5, min_lr=1e-6)
 
     mask_peaks_p = cfg["mask_peaks"]; mask_min = cfg["mask_peaks_min"]
 
     def gather_owner(tok):
-        loc = tok[:, :, 0].long().clamp(0, 23)
+        # loc = tok[:, :, 0].long().clamp(0, 23)
+        loc = tok[:, :, 0].long().clamp(0, CFG["n_loci"] - 1)
         ab = (torch.round(tok[:, :, 1] * 10).long() + ALLELE_OFF).clamp(0, owner_lut.size(1) - 1)
         return owner_lut[loc, ab]
 
@@ -350,7 +356,8 @@ def train(seed: int, out_subdir: str):
             loss_attr_v = loss_phi_v = 0.0
             if (attr >= 0).any():
                 la = out["logits_attr"]
-                li_ = tokens[..., 0].long().clamp(0, 23)
+                # li_ = tokens[..., 0].long().clamp(0, 23)
+                li_ = tokens[..., 0].long().clamp(0, CFG["n_loci"] - 1)
                 bi_ = (tokens[..., 1] * 10).round().long() + ALLELE_OFF
                 bi_ = bi_.clamp(0, cn_lut.size(1) - 1)
                 cn_ = cn_lut[li_, bi_]                                    # (B, N, C)
@@ -375,10 +382,12 @@ def train(seed: int, out_subdir: str):
                 raw_l_ = -(soft_y_ * log_p_).sum(-1)
                 vm_ = mask.bool().float()
                 loss_attr = (raw_l_ * vm_).sum() / vm_.sum().clamp(min=1)
-                loss_phi = F.l1_loss(out["phi"], phi)
-                loss = loss + (torch.exp(-log_var_attr) * loss_attr + log_var_attr
-                               + torch.exp(-log_var_phi) * loss_phi + log_var_phi)
-                loss_attr_v = loss_attr.item(); loss_phi_v = loss_phi.item()
+                # loss_phi = F.l1_loss(out["phi"], phi)
+                # loss = loss + (torch.exp(-log_var_attr) * loss_attr + log_var_attr
+                #                + torch.exp(-log_var_phi) * loss_phi + log_var_phi)
+                # loss_attr_v = loss_attr.item(); loss_phi_v = loss_phi.item()
+                loss = loss + torch.exp(-log_var_attr) * loss_attr + log_var_attr
+                loss_attr_v = loss_attr.item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -400,7 +409,7 @@ def train(seed: int, out_subdir: str):
             print(f"  Ep {epoch:3d} | loss={epoch_loss:.4f} (cls={epoch_cls/n:.3f} "
                   f"attr={epoch_attr/n:.3f} phi={epoch_phi/n:.3f}) "
                   f"| DEV macrec={val_macrec:.4f} em={val_em:.4f} f1={val_f1:.4f} "
-                  + f"| lr={optimizer.param_groups[0]['lr']:.1e}  ({time.time()-t0:.0f}s)", flush=True)
+                  + f"| lr={optimizer.param_groups[0]['lr']:.1e}")
 
         # NO early stopping: the selection metric saturates and a patience counter stops on noise.
         # Always run the full `epochs`. `best_model.pt` = best val epoch, `last_model.pt` =
@@ -408,12 +417,6 @@ def train(seed: int, out_subdir: str):
         if sel_score > best_sel:
             best_sel, best_epoch = sel_score, epoch
             torch.save(model.state_dict(), results_dir / "best_model.pt")
-            # Sidecar, not inside the checkpoint (loaded with weights_only=True): WHICH archive cut this
-            # backbone was trained on, so a later --init_from can refuse a mismatch.
-            if cur_stamp is not None:
-                st = dict(cur_stamp, withhold_donors=[], reject_open_rows=None)
-                cfg["_bb_src"] = "Phase 1 trained in this run"; cfg["_bb_stamp"] = dict(st)
-                json.dump(st, open(results_dir / "best_model.fold.json", "w"), indent=1)
         torch.save(model.state_dict(), results_dir / "last_model.pt")
     print(f"Training done in {time.time()-t0:.1f}s")
 
@@ -484,7 +487,9 @@ def train(seed: int, out_subdir: str):
 
     np.save(results_dir / "y_test_pred.npy", y_te_pred)
     np.save(results_dir / "y_test_true.npy", y_te_true)
-    np.save(results_dir / "count_proba.npy", p_count)
+
+    def _pn(lst):
+        return _pn_(lst)
 
     out_dict = {
         "model": "set_transformer", "config": cfg,
@@ -503,14 +508,9 @@ def train(seed: int, out_subdir: str):
         json.dump(out_dict, f, indent=2)
     print(f"\nSaved -> {results_dir}")
 
-    write_report(results_dir, ROOT, DATA_DIR, cfg, seed, eval_label, model, noc_te, k_post, k_gate,
-                 y_te_true, y_te_pred, topk_decode(rank_te, noc_te), rank_te, L_te, combo_id,
-                 len(open_ds), oracle, em_post, auroc, alpha_pr, count_info, k_src, _mf1,
-                 _param_fp_before)
-
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Train the clean inc22_fixed_aslot pipeline (one archive fold).")
+    ap = argparse.ArgumentParser(description="Train the clean inc22_fixed_aslot pipeline.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_subdir", type=str, default="inc22_fixed_aslot")
     args = ap.parse_args()

@@ -15,6 +15,7 @@ import numpy as np
 import re as _re_mod
 _RE_EXTRACT = _re_mod.compile(r"RD\d+-\d+-(\d+)(d[^-]*)-")
 from pathlib import Path
+import kit
 
 
 def _art_survival(ctx, ss, tok, mk, y, key, sr):
@@ -271,7 +272,8 @@ PULL_H_GRID = np.exp(np.linspace(0.0, np.log(30000.0), 25))
 def pull_neighbours(bin_locus, locus_names, bsz, win=2.0):
     """Per bin, the bins of OTHER dye channels within win bp of it (bin median sizes), padded with an index
     one past the last bin (height 0) and distance 99."""
-    dye = np.array([GF_DYE.get(locus_names[int(L)], -1) for L in bin_locus])
+    # dye = np.array([GF_DYE.get(locus_names[int(L)], -1) for L in bin_locus])
+    dye = np.array([kit.DYE.get(locus_names[int(L)], -1) for L in bin_locus])
     n = len(bsz); ks = []
     for j in range(n):
         if bsz[j] <= 0 or dye[j] < 0:
@@ -315,7 +317,8 @@ def _pull_table(ctx, want, nb, nd, bidx, loci):
     li = {name: i for i, name in enumerate(loci)}
     H = {"UnF": {}, "F": {}}
     for tag, sub in (("UnF", "PROVEDIt_1-5-Person CSVs UnFiltered"), ("F", "PROVEDIt_1-5-Person CSVs Filtered")):
-        for f in _glob.glob(str(raw / sub / "*GF29cycles" / "**" / "*.csv"), recursive=True):
+        # for f in _glob.glob(str(raw / sub / "*GF29cycles" / "**" / "*.csv"), recursive=True):
+        for f in [g for g in _glob.glob(str(raw / sub / f"*{kit.KIT}" / "**" / "*.csv"), recursive=True) if "Known Genotypes" not in g]:
             with open(f, newline="", encoding="utf-8-sig", errors="replace") as fh:
                 rd = _csv.reader(fh); head = next(rd)
                 si = head.index("Sample File"); mi = head.index("Marker")
@@ -1465,7 +1468,8 @@ def derive(ctx) -> dict:
             byl = {}
             for a5 in key[c]:
                 byl.setdefault(a5[0], []).append(a5)
-            v5 = np.array([sum(hm5.get(z, 0.0) for z in byl.get(L, [])) for L in range(24)])
+            # v5 = np.array([sum(hm5.get(z, 0.0) for z in byl.get(L, [])) for L in range(24)])
+            v5 = np.array([sum(hm5.get(z, 0.0) for z in byl.get(L, [])) for L in range(int(ctx.BIN_LOCUS.max()) + 1)])
             if (v5 > 0).sum() >= 20:
                 lv = np.log(np.where(v5 > 0, v5, np.nan))
                 _pl.setdefault(c, []).append(lv - np.nanmean(lv))
@@ -1792,7 +1796,8 @@ def derive(ctx) -> dict:
             mu_ = float(np.mean(list(w_.values())))
             # Keyed by TREATMENT and template band. Injection only moves the profile's level, which
             # the per-profile centring above already removes; treatment bends the pattern itself.
-            _mt = _re.search(r"RD14-0003-\d+d\d([A-Za-z0-9\-]*?)-[0-9.]+GF", str(names[i]))
+            # _mt = _re.search(r"RD14-0003-\d+d\d([A-Za-z0-9\-]*?)-[0-9.]+GF", str(names[i]))
+            _mt = _re.search(r"RD14-0003-\d+d\d([A-Za-z0-9\-]*?)-[0-9.]+" + kit.TAG, str(names[i]))
             _tt = (_mt.group(1).strip("-") or "a") if _mt else "a"
             _tr = (_tt, int(np.searchsorted(_tb, float(ng[i]), "right")) - 1)
             _pv.setdefault((c, _tr), []).append({a_: x - mu_ for a_, x in w_.items()})

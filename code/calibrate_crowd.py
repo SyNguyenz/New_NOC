@@ -3,6 +3,7 @@
 import importlib.util, json, os, re, sys, collections
 from pathlib import Path
 import numpy as np
+import kit
 CODE = Path(__file__).resolve().parent; REAL = Path(os.environ.get("STR_DATA_DIR", str(CODE / "data")))
 os.environ["STR_DATA_DIR"] = str(REAL); sys.path.insert(0, str(CODE))
 sp = importlib.util.spec_from_file_location("mi", CODE / "make_insilico.py")
@@ -60,7 +61,8 @@ def split(z, c):
     return float((z >= CR_TH).sum()), np.histogram(nz, HB)[0]
 
 
-RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+# RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 NM = json.load(open(REAL / "meta_sample_names_train.json")); Xs = np.load(REAL / "Xflat_train.npy"); ns = np.load(REAL / "noc_train.npy")
 CR = np.zeros((len(SB) - 1, len(HB) - 1)); CT = np.zeros_like(CR); NN = np.zeros(len(SB) - 1)
 SM = np.zeros(len(SB) - 1)

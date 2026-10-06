@@ -178,43 +178,43 @@ class ISABpp(nn.Module):
         return self.mab1(X, H, q_mask=pad_mask, kv_mask=None)        # (B,N,d)
 
 
-class PMA(nn.Module):
-    """Pooling by Multihead Attention with a learned never-masked null key/value, so an all-masked
-    set (e.g. fully out-of-panel after feas_filter) pools onto the null instead of NaN-ing."""
-    def __init__(self, d_model: int, n_heads: int, k_seeds: int = 1, dropout: float = 0.0):
-        super().__init__()
-        self.S = nn.Parameter(torch.empty(1, k_seeds, d_model)); nn.init.xavier_uniform_(self.S)
-        self.rff = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True))
-        self.mab = MAB_softmax(d_model, n_heads, dropout)
-        self.null_kv = nn.Parameter(torch.zeros(1, 1, d_model))
+# class PMA(nn.Module):
+#     """Pooling by Multihead Attention with a learned never-masked null key/value, so an all-masked
+#     set (e.g. fully out-of-panel after feas_filter) pools onto the null instead of NaN-ing."""
+#     def __init__(self, d_model: int, n_heads: int, k_seeds: int = 1, dropout: float = 0.0):
+#         super().__init__()
+#         self.S = nn.Parameter(torch.empty(1, k_seeds, d_model)); nn.init.xavier_uniform_(self.S)
+#         self.rff = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True))
+#         self.mab = MAB_softmax(d_model, n_heads, dropout)
+#         self.null_kv = nn.Parameter(torch.zeros(1, 1, d_model))
 
-    def forward(self, X: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
-        B = X.size(0)
-        S = self.S.expand(B, -1, -1)
-        Y = torch.cat([self.rff(X), self.null_kv.expand(B, -1, -1)], dim=1)
-        if pad_mask is not None:
-            null_col = torch.zeros(B, 1, dtype=torch.bool, device=pad_mask.device)
-            pad_mask = torch.cat([pad_mask, null_col], dim=1)
-        return self.mab(S, Y, key_padding_mask=pad_mask)
+#     def forward(self, X: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
+#         B = X.size(0)
+#         S = self.S.expand(B, -1, -1)
+#         Y = torch.cat([self.rff(X), self.null_kv.expand(B, -1, -1)], dim=1)
+#         if pad_mask is not None:
+#             null_col = torch.zeros(B, 1, dtype=torch.bool, device=pad_mask.device)
+#             pad_mask = torch.cat([pad_mask, null_col], dim=1)
+#         return self.mab(S, Y, key_padding_mask=pad_mask)
 
 
-class MAB_softmax(nn.Module):
-    """Plain LayerNorm MAB used only inside PMA (matches `MAB` in set_transformer.py; the PMA pool's
-    `mab` submodule). Kept under this name purely for clarity — its parameter names (attn/ff/norm1/
-    norm2) match the original so the checkpoint's `pma.mab.*` keys load."""
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.ff = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.ReLU(inplace=True),
-                                nn.Linear(4 * d_model, d_model))
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+# class MAB_softmax(nn.Module):
+#     """Plain LayerNorm MAB used only inside PMA (matches `MAB` in set_transformer.py; the PMA pool's
+#     `mab` submodule). Kept under this name purely for clarity — its parameter names (attn/ff/norm1/
+#     norm2) match the original so the checkpoint's `pma.mab.*` keys load."""
+#     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+#         super().__init__()
+#         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+#         self.ff = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.ReLU(inplace=True),
+#                                 nn.Linear(4 * d_model, d_model))
+#         self.norm1 = nn.LayerNorm(d_model)
+#         self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, X, Y, key_padding_mask=None):
-        attn_out, _ = self.attn(X, Y, Y, key_padding_mask=key_padding_mask)
-        attn_out = attn_out.nan_to_num(0.0)
-        H = self.norm1(X + attn_out)
-        return self.norm2(H + self.ff(H))
+#     def forward(self, X, Y, key_padding_mask=None):
+#         attn_out, _ = self.attn(X, Y, Y, key_padding_mask=key_padding_mask)
+#         attn_out = attn_out.nan_to_num(0.0)
+#         H = self.norm1(X + attn_out)
+#         return self.norm2(H + self.ff(H))
 
 
 # ── Sinkhorn OT (MESH, ICML2023) ────────────────────────────────────────────
@@ -373,7 +373,7 @@ class SetTransformerMixture(nn.Module):
             [ISABpp(d_model, n_heads, m_inducing, dropout) for _ in range(n_isab)])
 
         # pooling: shared pool (z)
-        self.pma = PMA(d_model, n_heads, k_seeds=1, dropout=dropout)
+        # self.pma = PMA(d_model, n_heads, k_seeds=1, dropout=dropout)
 
         # aslot decoder + CoSA genotype buffers/projection (registered exactly as in the original)
         self.cls_decoder_module = AdaptiveSlotDecoder(
@@ -389,7 +389,7 @@ class SetTransformerMixture(nn.Module):
 
         # privileged aux heads (in-silico only): per-peak attribution + phi abundance
         self.attr_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes + 1))
-        self.phi_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes))
+        # self.phi_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, n_classes))
 
         # noc_head_v2 (the published inc22 arm's --noc_head_v2): CORN ordinal count head on a
         # multiset-COUNT input = sorted prob profile + MAC physical features + mass-preserving
@@ -440,7 +440,8 @@ class SetTransformerMixture(nn.Module):
         """Returns (x0, H, pad_mask).  set_of_set: split peaks into private (n_car==1) / shared
         (n_car!=1) BEFORE the encoder; each set passes the SAME ISAB++ independently, then merge."""
         x0, pad_mask = self._project_tokens(tokens, mask)
-        li = tokens[..., 0].long().clamp(0, 23)
+        # li = tokens[..., 0].long().clamp(0, 23)
+        li = tokens[..., 0].long().clamp(0, self.n_loci - 1)
         bi = (tokens[..., 1] * 10).round().long() + self._AOFF
         bi = bi.clamp(0, self.owner_lut.size(1) - 1)
         n_car = self.owner_lut[li, bi].sum(-1)
@@ -510,13 +511,13 @@ class SetTransformerMixture(nn.Module):
         attr_raw = self.attr_head(H)                                  # (B, N, K+1) incl background (GSANet)
         slot_out = self.cls_decoder_module(H, pad_mask, geno_slots, attr_logits=attr_raw)
 
-        z = self.pma(H, pad_mask=pad_mask).squeeze(1)
+        # z = self.pma(H, pad_mask=pad_mask).squeeze(1)
 
         out = {
             "logits_cls":   slot_out["logits_cls"],
             "logits_card":  slot_out["logits_card"],
             "logits_attr":  attr_raw,
-            "phi":          F.softplus(self.phi_head(z)),
+            # "phi":          F.softplus(self.phi_head(z)),
         }
         if self.noc_head_v2:
             out["logits_count_v2"] = self._ord_count_logits(
