@@ -26,6 +26,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import kit
 
 HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("STR_DATA_DIR", str(HERE / "data")))
@@ -34,7 +35,7 @@ os.environ.setdefault("STR_DATA_DIR", str(DATA))
 _s = importlib.util.spec_from_file_location("make_insilico", HERE / "make_insilico.py")
 MI = importlib.util.module_from_spec(_s); _s.loader.exec_module(MI)
 
-RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
+RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 EDGES = np.array([0.0, 300.0, 600.0, 1200.0, 3000.0, 1e9])
 ITERS = int(os.environ.get("STR_STUT_SPREAD_ITERS", "4"))
 BADO = np.array([-3, -2, -1, 1, 2, 3, -.75, -.5, -.25, .25, .5, .75])
@@ -45,7 +46,7 @@ BADO = np.array([-3, -2, -1, 1, 2, 3, -.75, -.5, -.25, .25, .5, .75])
 TRIM = -1.0
 OWN = np.asarray(MI.DONOR_DOSAGE) > 0
 BL = np.asarray(MI.BIN_LOCUS, int)
-_W = np.floor(MI.BIN_ALLELE + 1e-6); UN = _W + np.round((MI.BIN_ALLELE - _W) * 10) / 4.0
+UN = MI.BIN_UNITS                                     # repeat units (make_insilico.BIN_UNITS)
 T1 = MI._OFF_TARGET[-10]
 
 

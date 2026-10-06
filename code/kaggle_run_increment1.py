@@ -9,7 +9,7 @@ replicate branching, no 60-arm job table.  Runs the full chain:
   (always)      train_set_transformer.py (model + decode layer: penalty/bonus, set-height greedy, drop rule)
   -> results/<out_subdir>_seed<seed>/{best_model.pt, metrics.json, y_test_pred.npy, y_test_true.npy}
 
-The DATA-PREP scripts (extract_phi_condition, synth/extract_genotypes, build_real_attr, extract_size,
+The DATA-PREP scripts (extract_phi_condition, synth/extract_genotypes, build_real_attr,
 make_insilico, features/enrich) are the PROVEN, shared dataset generators — they are
 INVOKED UNCHANGED from the project root (not rewritten), because they define the exact in-silico
 dataset and rewriting them would change the data / break reproducibility.  The clean REWRITE is the

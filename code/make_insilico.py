@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse, json, math, os, shutil
 from pathlib import Path
 import numpy as np
+import kit
 
 ROOT = Path(__file__).resolve().parent
 # Configurable for Kaggle/Colab: STR_DATA_DIR (input real data), STR_OUT_DIR (in-silico out)
@@ -47,7 +48,7 @@ for j, col in enumerate(FLAT_COLS):
 def build_bin_size():
     """Per-FLAT-bin fragment size (bp), median over real peaks. size(bp) is ~deterministic per
     (locus, allele) — gives in-silico mixtures a realistic size channel (degradation substrate,
-    Increment 2a). Needs data/size_train.npy (extract_size.py). Returns (N_FLAT,) float32 or None."""
+    Increment 2a). Needs data/size_train.npy (preprocess.py). Returns (N_FLAT,) float32 or None."""
     sp = DATA / "size_train.npy"
     if not sp.exists():
         return None
@@ -88,8 +89,13 @@ def build_bin_size():
 
 
 BIN_SIZE_MIN_N = 3                                          # a median of fewer peaks is left to the per-locus line
-BIN_SIZE_RL = {"D22S1045": 3}                               # repeat length (bp); every other GlobalFiler STR is 4
+BIN_SIZE_RL = kit.REPEAT_BP                                 # repeat length (bp); every other locus is 4
 _LOC_NAME = {v: k for k, v in LOCUS_TO_IDX.items()}
+# Allele positions in REPEAT UNITS: a microvariant's suffix is in bp (12.2 = 12 repeats + 2 bp), so it is divided by
+# the locus's own repeat length - 4 bp for most loci, 3 for D22S1045, 5 for Penta D / E (kit.REPEAT_BP).
+_W_UN = np.floor(BIN_ALLELE + 1e-6)
+BIN_UNITS = _W_UN + np.round((BIN_ALLELE - _W_UN) * 10) / np.array(
+    [kit.REPEAT_BP.get(_LOC_NAME.get(int(L), ""), 4) for L in BIN_LOCUS], float)
 
 # Real val/test combos (donor IDs) — for fidelity check / version-A generation and, critically, for
 # EXCLUDING them from the in-silico train (build_train). READ FROM meta_set.json so they follow the
@@ -396,7 +402,7 @@ def _shoulder_h(occ_h):
 # (.78-.95); the one flat SHOULDER_ART (.72) averaged the two and let the generator show .59 at 1 bp and cut 2-3 bp to
 # .57-.68. So the shoulder is looked up by distance: 1, 2 or 3 bp (data/shoulder_bp.json, calibrate_shoulder.py), for
 # artefact survival and for the noise floor alike; without the file it falls back to the flat terms above.
-_Wsh = np.floor(BIN_ALLELE + 1e-6); _UNsh = _Wsh + np.round((BIN_ALLELE - _Wsh) * 10) / 4.0
+_UNsh = BIN_UNITS
 _NBP = {1: ([], []), 2: ([], []), 3: ([], [])}
 for _L in np.unique(BIN_LOCUS):
     _b = np.flatnonzero((BIN_LOCUS == _L) & (BIN_ALLELE >= 0))
@@ -2460,7 +2466,7 @@ _CONDTAB = [None]
 def _condition_table():
     if _CONDTAB[0] is None:
         import re as _re2
-        rx = _re2.compile(r"RD\d+-\d+-\d+d\d+([A-Za-z0-9\-]*?)-[\d.]+GF-Q([\d.]+)_")
+        rx = _re2.compile(r"RD\d+-\d+-\d+d\d+([A-Za-z0-9\-]*?)-[\d.]+" + kit.TAG + r"-Q([\d.]+)_")
         by = {}
         for n in json.load(open(DATA / "meta_sample_names_train.json")):
             m = rx.search(str(n))
@@ -2501,11 +2507,11 @@ def _design_ng(k):
     """Total template amounts (ng) PROVEDIt ran with exactly `k` contributors, clamped to 1..5."""
     if _DESIGN_NG[0] is None:
         import csv as _csv, glob as _glob, re as _re3
-        rx_t = _re3.compile(r"-([\d.]+)(?:GF|IP|PP)")
+        rx_t = _re3.compile(r"-([\d.]+)(?:GF|IP|PP|F6C)")
         raw = Path(__file__).resolve().parent.parent / "data_raw"
         by = {}
         for f in _glob.glob(str(raw / "**" / "*.csv"), recursive=True):
-            if "3500_GF29cycles" not in f:
+            if kit.KIT not in f or "Known Genotypes" in f:
                 continue
             with open(f, newline="", encoding="utf-8", errors="ignore") as fh:
                 r = _csv.reader(fh); next(r, None)
@@ -2627,7 +2633,7 @@ def build_train(n_mix, pool, rng, noc_p=None):
         attr_real[r, mask_real[r].astype(bool)] = d_ss[r]
     phi_real = np.zeros((len(d_ss), 45), np.float32); phi_real[np.arange(len(d_ss)), d_ss] = 1.0
     attr_list = [attr_real]; phi_list = [phi_real]
-    # Increment 2a: per-peak size(bp). Real SS rows carry their real size (extract_size.py); in-silico
+    # Increment 2a: per-peak size(bp). Real SS rows carry their real size (preprocess.py); in-silico
     # peaks get size from the per-bin table (size ~deterministic per locus,allele).
     bin_size = build_bin_size()
     sp = DATA / "size_train.npy"
@@ -2662,7 +2668,7 @@ def build_train(n_mix, pool, rng, noc_p=None):
             frac_real[r, _lab, 0] = 1.0
             col_real[r, 0] = c
     print(f"Keeping {ss.sum()} real single-source. Generating {n_mix} in-silico mixtures..."
-          f" (size channel: {'ON' if bin_size is not None else 'OFF — run extract_size.py'})")
+          f" (size channel: {'ON' if bin_size is not None else 'OFF — run preprocess.py'})")
     Xf_new, y_new, noc_new, tok_new, mask_new, attr_new, phi_new = [], [], [], [], [], [], []
     made = 0
     while made < n_mix:

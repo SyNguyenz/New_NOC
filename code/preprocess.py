@@ -2,7 +2,7 @@
 inc22_clean/preprocess.py — CONSOLIDATED raw -> full inc22 dataset, ONE command.
 
 Design (per request): readers of the SAME source are MERGED; readers of DIFFERENT sources stay SEPARATE.
-  • SAME source (GF29cycles Filtered CSVs): prepare_data_set + extract_size  -> MERGED into csv_pass():
+  • SAME source (the kit's Filtered CSVs, STR_KIT): base arrays + per-peak size -> ONE csv_pass():
     the CSVs are read ONCE (identical pd.concat) and BOTH the base arrays (tokens/mask/Xflat/y/noc/meta/
     names) AND per-peak size are produced from that single DataFrame. Verbatim logic from both scripts on
     the shared `raw` -> bit-identical to running them separately.
@@ -23,11 +23,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedGroupKFold
+import kit
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "data"
 RAW_FILTERED = HERE / "data_raw" / "PROVEDIt_1-5-Person CSVs Filtered"
-KIT_PATTERN = str(RAW_FILTERED / "*GF29cycles" / "**" / "*.csv")
+KIT_PATTERN = str(RAW_FILTERED / f"*{kit.KIT}" / "**" / "*.csv")
 # Peaks per profile kept as tokens. 160 cut 7-10 % of the real NOC4-5 profiles (up to 176 peaks) and 20 % of the
 # in-silico NOC5 (up to 191), and the two sides were cut differently: real in CSV order, which drops whole loci of the
 # last dye, tall alleles included; the generator by keeping the tallest. The most any GF profile carries is 214, so
@@ -103,10 +104,10 @@ def allele_key(v):                                            # verbatim: extrac
 
 
 def csv_pass():
-    """MERGED prepare_data_set + extract_size — read the GF29 CSVs ONCE, emit base arrays + size."""
+    """Read the kit's Filtered CSVs ONCE, emit base arrays + per-peak size."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print("Scanning GF29cycles CSVs …")
-    csv_files = glob.glob(KIT_PATTERN, recursive=True)
+    print(f"Scanning {kit.KIT} CSVs …")
+    csv_files = [f for f in glob.glob(KIT_PATTERN, recursive=True) if "Known Genotypes" not in f]
     print(f"  Found {len(csv_files)} CSV files")
     dfs = [pd.read_csv(f, low_memory=False) for f in csv_files]
     raw = pd.concat(dfs, ignore_index=True)                   # <-- the single shared read
@@ -282,7 +283,7 @@ def csv_pass():
         with open(DATA_DIR / f"meta_sample_names_{split}.json", "w") as f:
             json.dump(names, f)
     meta = {
-        "kit": "3500_GF29cycles", "loci": loci, "locus_to_idx": locus_to_idx,
+        "kit": kit.KIT, "loci": loci, "locus_to_idx": locus_to_idx,
         "locus_bin_lists": {loc: [float(v) for v in bins] for loc, bins in locus_bin_lists.items()},
         "flat_cols": flat_cols, "n_flat": n_flat, "max_seq": MAX_SEQ,
         "known_donors": KNOWN_DONORS, "unknown_donors": UNKNOWN_DONORS, "random_seed": RANDOM_SEED,
@@ -306,7 +307,7 @@ def csv_pass():
                    "unknown_donors": UNKNOWN_DONORS, "known_donors": KNOWN_DONORS}, f, indent=2)
     print(f"  FOLD {FOLD}/{N_FOLDS}  unknown={UNKNOWN_DONORS}")
 
-    # ===== extract_size: per-peak size from the SAME `raw` (verbatim logic) =====
+    # ===== per-peak size from the SAME `raw` =====
     print("Building per-peak size from the same CSVs …")
     look = defaultdict(dict)
     for _, row in raw.iterrows():
@@ -358,7 +359,9 @@ def main():
         if d.exists():
             shutil.rmtree(d)
     print(f"fold {FOLD}: data/ and data_insilico_w/ cleared, rebuilding from data_raw")
-    csv_pass()                                                         # GF29 CSVs (MERGED) -> base + size
+    import kit_raw
+    kit_raw.main()                                                     # the kit's .xlsx exports -> .fromxlsx.csv
+    csv_pass()                                                         # the kit's CSVs (MERGED) -> base + size
     step("build_donor_geno.py")                                       # xlsx        -> donor_geno + mask
     step("extract_phi_condition.py")                                  # names       -> phi/condition
     step("synth/extract_genotypes.py")                                # tokens      -> donor_genotypes.csv

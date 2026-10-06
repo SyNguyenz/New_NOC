@@ -32,6 +32,8 @@ STR_EVAL_ONLY=1 STR_INIT_FROM=<ckpt> STR_DATA_DIR=<data_dir> ...     # decode/ev
 
 Environment: `STR_DATA_DIR`, `STR_DEVICE` (cpu/cuda/mps), `STR_BATCH` (256 = recipe; 128 on a 4 GB card),
 `STR_EPOCHS`, `STR_LR`, `STR_INIT_FROM`, `STR_EVAL_ONLY` (`STR_FOLD` is set by preprocess.sh).
+Kit: `STR_KIT` = `3500_GF29cycles` (default) or `3500_F6C29cycles_hlfrxn`; raw folder, genotype file, dye
+layout and repeat lengths come from `kit.py`, the number of loci from the data. Set it for preprocess and training alike.
 
 ## Model (`models/set_transformer.py`)
 

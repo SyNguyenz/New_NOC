@@ -358,7 +358,7 @@ class SetTransformerMixture(nn.Module):
         self.n_token_feats = n_token_feats
 
         # owner_lut carrier LUT (set_of_set / feas_filter / count features) — registered buffer.
-        self.register_buffer("owner_lut", owner_lut.float())           # (24, LUT_W, C)
+        self.register_buffer("owner_lut", owner_lut.float())           # (n_loci, LUT_W, C)
 
         n_num = n_token_feats - 1
         self.locus_embed = nn.Embedding(n_loci + 1, d_locus, padding_idx=n_loci)
@@ -440,7 +440,7 @@ class SetTransformerMixture(nn.Module):
         """Returns (x0, H, pad_mask).  set_of_set: split peaks into private (n_car==1) / shared
         (n_car!=1) BEFORE the encoder; each set passes the SAME ISAB++ independently, then merge."""
         x0, pad_mask = self._project_tokens(tokens, mask)
-        li = tokens[..., 0].long().clamp(0, 23)
+        li = tokens[..., 0].long().clamp(0, self.n_loci - 1)
         bi = (tokens[..., 1] * 10).round().long() + self._AOFF
         bi = bi.clamp(0, self.owner_lut.size(1) - 1)
         n_car = self.owner_lut[li, bi].sum(-1)
