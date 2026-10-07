@@ -15,7 +15,7 @@ _RE_EXTRACT = _re_mod.compile(r"RD\d+-\d+-(\d+)(d[^-]*)-")
 import kit
 
 
-def _art_survival(ctx, ss, tok, mk, y, key, sr):
+def _art_survival(ss, tok, mk, y, key, sr):
     """What fraction of an emitted artefact is actually seen, against its OWN expected height.
 
     Two things have to come out before this is measurable: the baseline noise that sits on a bin
@@ -190,7 +190,7 @@ def _noise_floor(ctx, ss, tok, mk, y, key):
             float(hts.mean()) if len(hts) else 2.18, loc_sd, loc_mu, loc_p, run_f, bin_p, loc_q, rho)
 
 
-def _art_rarity(ctx, ss, tok, mk, y, key, tabl, EH, SP, edges):
+def _art_rarity(ss, tok, mk, y, key, tabl, EH, SP, edges):
     """How much of the emission survives, against how COMMON the target allele is in the panel.
 
     A stutter landing where few donors carry an allele is far less likely to be called: at a fixed
@@ -921,7 +921,7 @@ def derive(ctx) -> dict:
         # flat per-locus ratio was used here first and the table came out inconsistent with itself:
         # it predicted an n-1 rate of 0.477 on real's own parents where real measures 0.573, because
         # the allele trend spreads expected heights across a curve that is anything but linear.
-        _EH, _SP, _ = _art_survival(ctx, ss, tok, mk, y, key, _fit)
+        _EH, _SP, _ = _art_survival(ss, tok, mk, y, key, _fit)
         _PI, _PF, _PN, _NM, _NS, _LMU, _LP, _NR, _BP, _LQ, _RHO = _noise_floor(ctx, ss, tok, mk, y, key)
         out["noise_loc_q"], out["noise_rho"] = _LQ, _RHO
         out["noise_bin_p"] = _BP
@@ -1018,7 +1018,7 @@ def derive(ctx) -> dict:
         out["art_table_loc"] = {k_: sorted(v, key=lambda t: -t[1]) for k_, v in tabl.items()}
         _CE = [0, 1, 3, 6, 11, 21]
         out["art_carr_edges"] = _CE
-        out["art_carr_mult"] = _art_rarity(ctx, ss, tok, mk, y, key, tabl, _EH, _SP, _CE)
+        out["art_carr_mult"] = _art_rarity(ss, tok, mk, y, key, tabl, _EH, _SP, _CE)
     except Exception:
         pass
     out["template_ng"] = np.array(tpl)

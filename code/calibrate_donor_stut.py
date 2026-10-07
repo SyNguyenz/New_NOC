@@ -108,7 +108,7 @@ def main():
     # which leaves the emission at ~.8 where real shows .02. Here each pair's real presence is pulled toward the twin's
     # by K_PSEUDO runs' worth: 1 of 45 becomes .12, 0 of 8 becomes .37.
     raw = {}
-    for (c, p), diff, s2, ra, tb, n in rows:
+    for (c, p), _, _, ra, tb, n in rows:
         ppost = (ra * n + K_PSEUDO * tb) / (n + K_PSEUDO)
         raw[(c, p)] = (float(np.clip(logit(ppost) - logit(tb), -6.0, 3.0)), n)
     # CENTRED per allele (run-weighted mean 0): only the differences BETWEEN donors of one allele belong here. Left
@@ -131,7 +131,7 @@ def main():
     worst = sorted(rows, key=lambda r: r[1])[:12]
     loci = json.load(open(DATA / "meta_set.json"))["loci"]
     inv = {v: k for k, v in MI.COL.items()}
-    for (c, p), diff, s2, ra, tb, n in worst:
+    for (c, p), _, _, ra, tb, n in worst:
         print(f"  donor {inv.get(c, c):>3} {loci[BL[p]]:<9} {MI.BIN_ALLELE[p]:<5} real {ra:.2f} twin {tb:.2f} (n {n})"
               f"  offset {out[str(c)][str(p)]:+.2f}")
 

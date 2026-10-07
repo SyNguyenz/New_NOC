@@ -242,13 +242,10 @@ $$
 - Cổng $\in(0,1)$ cho biết slot/donor đó "có tồn tại" trong hỗn hợp không. Nhiễu **Logistic** (không phải một Gumbel đơn) là relaxation đúng của biến Bernoulli — xem ghi nhớ *Gumbel-Sigmoid / Binary Concrete*.
 - Code: bước 4 — `models/set_transformer.py`.
 
-### E.4 Logit phân loại & logit đếm
+### E.4 Logit phân loại
 
 $$
 \boxed{\ \text{logits\_cls} = \underbrace{\mathrm{cls\_head}(S)}_{\text{nội dung}} \;+\; \underbrace{\text{gate\_logit}}_{\text{tồn tại}}\ }
-$$
-$$
-\text{logits\_card} = W_{\text{noc}}\,\text{gate}\in\mathbb R^{B\times 5}
 $$
 
 - Cộng trong **không gian logit** = tích hai xác suất (content × existence). `cls_head` = `LayerNorm → Linear(d→1)`.
@@ -256,30 +253,11 @@ $$
 
 ---
 
-## F. Các head phụ (pooling)
-
-### F.1 PMA — Pooling by Multihead Attention
-
-$$
-Y=[\,\mathrm{rff}(X)\ \Vert\ \text{null\_kv}\,],\qquad
-z = \mathrm{MAB}_{\text{softmax}}(S_{\text{seed}},\,Y)
-$$
-
-- Một "null key/value" không bao giờ bị che ⇒ tập rỗng (sau feas_filter) gộp về null thay vì NaN. $S_{\text{seed}}$ là 1 seed học được.
-- Code: `PMA.forward` — `models/set_transformer.py`.
-
-### F.2 phi (độ phong phú hỗn hợp)
-
-$$
-\phi = \mathrm{softplus}\big(W_\phi\,z\big)\in\mathbb R_{\ge0}^{B\times 45},\qquad
-\mathrm{softplus}(x)=\log(1+e^x)
-$$
-
-- Đầu ra không âm, hồi quy về tỷ lệ đóng góp $\phi$ của từng donor. Code: `models/set_transformer.py`.
-
-### F.3 Open set
+## F. Open set
 
 Không có head reject: open score tính sau decode từ các đặc trưng khớp-panel (xem `decode_layer.py`, bước 4).
+
+## G. Loss
 
 ### G.1 Asymmetric Loss — ASL (Ben-Baruch 2020) cho `logits_cls`
 
@@ -307,17 +285,9 @@ $$
 
 - $g$ **không** detach: số hạng này đi qua `gate_logit` vào encoder.
 
-### G.3 CORN (noc_head_v2)
+### G.3 (đã bỏ) Reject BCE — mô hình chỉ train trên closed set
 
-$$
-\mathcal L_{\text{corn}} = \mathrm{CORN}\big(\text{logits\_count\_v2},\ \mathrm{NOC}\big)
-$$
-
-- Đầu vào detach, không bao giờ decode; giữ lại vì gradient của nó nằm trong mẫu số của `clip_grad_norm_` (bỏ đi đo được là tệ hơn).
-
-### G.4 (đã bỏ) Reject BCE — mô hình chỉ train trên closed set
-
-### G.5 soft_attr_label CE — nhãn mềm kiểu EuroForMix ($\phi\cdot CN$)
+### G.4 soft_attr_label CE — nhãn mềm kiểu EuroForMix ($\phi\cdot CN$)
 
 Với mỗi peak $p$, xác suất nó thuộc donor $c$ tỷ lệ với $\phi_c$ × số bản sao allele $CN_{c}$:
 
@@ -332,38 +302,27 @@ $$
 - $CN=2$ nếu đồng hợp (homozygous), $1$ nếu dị hợp. Đây là nhãn "đặc quyền" (chỉ có với dữ liệu in-silico) gắn mỗi peak với donor — gần với mô hình EuroForMix (chia chiều cao theo $\phi\cdot CN$). Xem ghi nhớ *EuroForMix continuous model*.
 - Code: `train_set_transformer.py`.
 
-### G.6 phi L1
+### G.5 Kendall — trọng số bất định đồng phương sai (Kendall 2018)
 
-$$
-\mathcal L_\phi = \frac{1}{45}\sum_c \big|\,\phi_c - \phi_c^{\text{true}}\,\big|
-$$
-
-- Code: `train_set_transformer.py`.
-
-### G.7 Kendall — trọng số bất định đồng phương sai (Kendall 2018)
-
-Hai loss phụ được cân bằng tự động bằng tham số $\log\text{var}$ học được:
+Loss phụ được cân bằng tự động bằng tham số $\log\text{var}$ học được:
 
 $$
 \mathcal L_{\text{aux}} =
-e^{-s_{\text{attr}}}\,\mathcal L_{\text{attr}} + s_{\text{attr}}
-+ e^{-s_{\phi}}\,\mathcal L_{\phi} + s_{\phi},\qquad s=\log\sigma^2
+e^{-s_{\text{attr}}}\,\mathcal L_{\text{attr}} + s_{\text{attr}},\qquad s=\log\sigma^2
 $$
 
 - $e^{-s}=1/\sigma^2$ là trọng số (nhiệm vụ nhiễu nhiều → $\sigma^2$ lớn → trọng số nhỏ); $+s$ là số hạng phạt chống $\sigma^2\to\infty$. Không cần dò tay trọng số.
 - Code: `train_set_transformer.py`.
 
-### G.8 Tổng loss
+### G.6 Tổng loss
 
 $$
 \boxed{\ \mathcal L = \mathcal L_{\text{ASL}}
-+ 0.5\,\mathcal L_{\text{rej}}
 + 0.05\,\mathcal L_{\text{gate}}
-+ 0.3\,\mathcal L_{\text{corn}}
 + \mathcal L_{\text{aux}}\ }
 $$
 
-### G.9 mask_peaks (augmentation)
+### G.7 mask_peaks (augmentation)
 
 Mỗi epoch, bỏ ngẫu nhiên ~15% peak **shared** (giữ peak private của minor), miễn còn ≥ 8 peak:
 
@@ -463,10 +422,9 @@ donor_geno ─D(CoSA)→ geno_slots ───────┤
                                        ▼
                        E: GSANet → MESH(Sinkhorn ×3) → AdaSlot(Gumbel-Sigmoid)
                                        ▼
-            logits_cls = cls_head(S) + gate_logit ;  logits_card = noc_head(gate)
-            phi = softplus(phi_head(PMA(H)))
+            logits_cls = cls_head(S) + gate_logit ;  logits_attr (per-peak)
                                        ▼
-  loss = ASL + 0.5·BCE_rej + 0.05·SmoothL1(Σgate) + 0.3·CORN + Kendall(CE_attr + L1_phi)
+  loss = ASL + 0.05·SmoothL1(Σgate) + Kendall(CE_attr)
                                        ▼
   decode: phạt + thưởng trên gate → k ; φ-rerank (EM Mx → LOP) → greedy theo chiều cao → luật bỏ
 ```

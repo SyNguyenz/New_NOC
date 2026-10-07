@@ -121,22 +121,8 @@ AT = float(os.environ.get("STR_AT", "10.0"))   # analytical/detection threshold 
 #   AT=14, so AT=10 closes BOTH the faint tail (real p10=10) and occupancy (->5.7~5.74). (Overlay over-occupied at low AT;
 #   the peak model doesn't because it generates the faint tail physically rather than retaining spurious overlay peaks.)
 
-# ── Back-stutter model (grounded; the overlay LOSES minor stutter in mixing -> synth 0.09 vs real 0.14). ──
-# Physically: mixture back-stutter at allele a-1 = SR(a) * (summed parent height at a), SR linear in LUS
-# (LUS~allele for simple repeats; NGM-SELect coeffs slope~0.007-0.011, intercept~-0.03..-0.058; SR~5-15%,
-# log-normal noise). Applied to the SUMMED mixture (correct: total stutter = SR x total parent). NO double-count
-# guard = re-measured final stutter must MATCH real (~0.136), not exceed it. Toggle STR_STUTTER=0 to disable.
-STUTTER = int(os.environ.get("STR_STUTTER", "1"))
-SR_SLOPE = 0.0066; SR_INTERCEPT = -0.040; SR_SIGMA = 0.30   # SR=clip(slope*allele+intercept, .01,.18)*lognormal(0,sigma); calibrated so final stutter~real 0.136 (not over)
 _BININDEX = {(int(BIN_LOCUS[j]), round(float(BIN_ALLELE[j]), 1)): j for j in range(N_FLAT)}
-STUTTER_TARGET = np.full(N_FLAT, -1, dtype=np.int64)   # bin at (same locus, allele-1 repeat) where back-stutter lands
-FWD_TARGET = np.full(N_FLAT, -1, dtype=np.int64)       # bin at allele+1: FORWARD stutter (n+1)
 _OFF_TARGET: dict[int, np.ndarray] = {}                # offset (0.1 repeat units) -> target bin per bin
-for j in range(N_FLAT):
-    a = float(BIN_ALLELE[j])
-    if a >= 0:                                          # skip X(-2)/Y(-1) amel
-        STUTTER_TARGET[j] = _BININDEX.get((int(BIN_LOCUS[j]), round(a - 1.0, 1)), -1)
-        FWD_TARGET[j] = _BININDEX.get((int(BIN_LOCUS[j]), round(a + 1.0, 1)), -1)
 # Range must cover ART_SPAN: the table may name offsets out to 8 repeats, and an offset with no entry
 # here is dropped in silence - which is what happened when the span was widened and nothing changed.
 for d in range(-int(float(os.environ.get("STR_ART_SPAN", "100"))),
@@ -183,8 +169,6 @@ for d in range(-int(float(os.environ.get("STR_ART_SPAN", "100"))),
 # source profile. It was removed: the profile is a real run and already carries its own degradation, so
 # the extra tilt double-counted it and halved the median true-peak height. Real degradation variety
 # comes from the pool itself.
-FS_RATE  = float(os.environ.get("STR_FS_RATE", "0.0155"))   # measured median n+1 / parent (back: 0.0681)
-FS_SIGMA = 0.50                # real p90/median is heavier, but that tail is contaminated by noise peaks
 # Ratio ceiling r_max = R_SPREAD_FLOOR * (k-1): 15 / 30 / 45 / 60 at k = 2..5. The reference data tops
 # out at 9:1 at EVERY k — its {1,2,4,9} grid does not widen with contributor count — so 6+5(k-2) was
 # NARROWER than reality at k=2,3 (min-phi p5 0.223 against real's 0.100) and wider at k=4,5. A ceiling
@@ -236,9 +220,7 @@ ART_SPAN = float(os.environ.get("STR_ART_SPAN", "25"))
 # 0.100 / 0.064 / 0.051 at the three middle bands.
 ART_MASS_A = float(os.environ.get("STR_ART_MASS_A", "0.050"))
 ART_MASS_N = float(os.environ.get("STR_ART_MASS_N", "279.0"))
-BUDGET_SOLVE = os.environ.get("STR_BUDGET_SOLVE", "1") == "1"
 TOL_ITERS = int(os.environ.get("STR_TOL_ITERS", "2"))
-ACCEPT = os.environ.get("STR_ACCEPT", "1") == "1"
 TOL_SLOPE = float(os.environ.get("STR_TOL_SLOPE", "0.0025"))   # size decline against the treatment
 TOL_SHARE = float(os.environ.get("STR_TOL_SHARE", "0.35"))     # each contributor against its phi
 BASE_SLOPE = 0.0006                                            # untreated baseline, measured on NOC1
@@ -330,14 +312,6 @@ def cal(key, default):
     except Exception:
         return default
 
-SR_SCALE = 1.0             # Stripping the source profile's artefacts also strips its stutter, so the
-#   generated stutter now carries the whole load: at 0.301 (calibrated while the source stutter was
-#   still present) a reconstructed NOC5 mixture had 116 peaks against real's 129, and at 1.0 it has 122.
-#   The value saturates above 1.0, and MAC still reads 10 against real's 12, so stutter alone does not
-#   account for the busiest locus - that gap is still open. Historical note: the shipped formula yields
-#   a single-source back-stutter median of 0.107
-#   against the 0.068 measured on real single-source profiles; the NGM-SELect coefficients it is built
-#   from describe a different kit, and this dataset's own profiles are the better authority.
 # Gamma shape against expected peak height, from the measured CV curve (shape = 1/CV^2):
 #   <30 RFU CV .381 -> 6.9 | 30-80 .397 -> 6.3 | 80-200 .396 -> 6.4 | 200-600 .313 -> 10.2
 #   >600 .170 -> 34.6
@@ -357,7 +331,7 @@ SR_SCALE = 1.0             # Stripping the source profile's artefacts also strip
 #   20.74/43.57/69.64), so what remained of the pooled p90 gap was peak COUNT, not peak height.
 
 #   AT=10 sits at the p25 of the observed height distribution and truncates the whole faint tail, which
-#   is measurable on NOC1 without touching any mixture. AT_PC, NOISE_N and SR_SCALE interact - a lower
+#   is measurable on NOC1 without touching any mixture. AT_PC, NOISE_N and the stutter scale interact - a lower
 #   threshold retains more of both the noise floor and the stutter - so the three are solved together
 #   against three single-source targets (peak count 93, artefact fraction 0.612, back-stutter 0.068)
 #   rather than set one at a time. NOISE_N is the count that SURVIVES the threshold, not the count
@@ -379,21 +353,8 @@ NOISE_P_FRAC = float(cal("noise_p_frac", 0.075))
 SHOULDER_H = np.asarray(cal("shoulder_h", [49.0, 176.0, 534.0, 1630.0, 4732.0]), float)
 SHOULDER_NOISE = np.asarray(cal("shoulder_noise", [0.647, 0.432, 0.310, 0.219, 0.220]), float)
 SHOULDER_ART = float(cal("shoulder_art", 0.72))
-_SH_ORDER = [s * d for d in range(1, 10) for s in (1, -1)]
 
 
-def _shoulder_h(occ_h):
-    """Height of the nearest allele peak within one repeat of every bin, 0 where there is none."""
-    H = np.zeros(N_FLAT); done = np.zeros(N_FLAT, bool)
-    for dd in _SH_ORDER:
-        t = _OFF_TARGET.get(dd)
-        if t is None:
-            continue
-        ok = (~done) & (t >= 0)
-        hv = np.zeros(N_FLAT); hv[ok] = occ_h[t[ok]]
-        hit = ok & (hv > 0)
-        H[hit] = hv[hit]; done |= hit
-    return H
 
 
 # ...and the bp DISTANCE to that neighbour decides almost everything, contrary to the note above: re-measured on NOC1
@@ -540,7 +501,6 @@ if _ASD.exists() and int(os.environ.get("STR_ART_SCAT_D", "1")):
     ART_SCAT_D = {int(k): float(v) for k, v in json.load(open(_ASD)).items()}
 # The per-draw cap at the largest ratio NOC1 ever showed is the only mechanism that cuts the upper tail, and
 # the tail is what is short where parents stack (P(>3x expected) at bins fed by 3 sources: real 2.8 % vs 1.1 %).
-ART_CAP = int(os.environ.get("STR_ART_CAP", "1"))
 # WHY THERE IS NO "emit from the realised parent" KNOB. It would be inert: in the path this generator uses (the
 # filtered overlay) `contrib_exp = contrib.copy()`, so the template and the realised heights are the same numbers and
 # there is nothing to couple - tried as STUT_REAL_W over 0..1 and every statistic was identical to three decimals.
@@ -692,7 +652,6 @@ ART_SURV_P = np.asarray(cal('art_surv_p', [0.043, 0.145, 0.220, 0.339, 0.491, 0.
 # Which alleles an amplification keeps is drawn again rather than copied from the source profile; see
 # _relottery. Real runs of one specification differ by 0.0561 where the binomial law predicts 0.0588, so the
 # lottery is independent between runs and copying one realisation freezes an ensemble that should move.
-RELOTTERY = os.environ.get("STR_RELOTTERY", "1") == "1"
 # Chance an allele is lost, against its own RFU - measured on NOC1 across the whole dilution ladder, since
 # 45 profiles at one level never reach the faint end. It says WHICH allele a redrawn lottery takes.
 DROP_H = np.asarray(cal("drop_h", [0.0, 15.0, 40.0, 100.0, 250.0, 500.0, 1e9]), float)
@@ -727,8 +686,6 @@ RFU_INJ_BETA = float(cal('rfu_coef', [0.976, 0.948, 9.743])[1])
 # Baseline fragment-length slope that survives after a treatment's own cond_beta is taken out:
 # -0.00063 (sd 0.00027 across the seventeen treatments on NOC1).
 DEG_BASE = float(cal("deg_base", 0.00063))
-DEG_RESET = os.environ.get("STR_DEG_RESET", "1") == "1"
-TPL_SPREAD = os.environ.get("STR_TPL_SPREAD", "4")
 # LEVEL CONVERSION. A source is a real run at a ladder level, and the target rarely sits exactly on
 # one - and in the honest case, a different amplification of the same DNA, never: PROVEDIt holds ONE
 # PCR product per donor, treatment and template, so the only other amplification is at another level.
@@ -865,7 +822,6 @@ AMP_STEP_VAR_INJ = {float(_k): np.asarray(_v, float) for _k, _v in (cal("amp_ste
 # heterozygote balance within ~0.03. A per-locus efficiency on top was tried and removed: the source already
 # carries its donor's locus pattern, and adding one widened bright profiles to 0.78-0.82 against real 0.63-0.70.
 # Presence is decided here and nowhere else - the source is complete - so no loss is charged twice.
-FILTER = os.environ.get("STR_FILTER", "1") == "1"
 FILT_PG = 0.0066
 FILT_CV = 0.3
 FILT_A = {"a": 2.0, "DNase": 1.25, "Fragmentase": 1.25, "UV": 0.5, "sonication": 1.5, "humic": 0.5}
@@ -946,7 +902,7 @@ STUT_LT_RANGE = (0.3, 1.7)
 # more often on a bin some panel donor carries than on one nobody carries, against 1.52x for the twin, which had no
 # drop-in. So a drop-in event is one allele of another person: a locus at random, then an allele drawn by how often
 # the panel carries it (a common allele is a common drop-in - which is exactly a decoy's allele). WHERE it lands needs
-# no fitting; HOW OFTEN (DI_RATE per profile) and HOW TALL (log-normal DI_LMU, DI_LSD at the reference injection,
+# no fitting; HOW OFTEN (DI_RATE per profile) and HOW TALL (log-normal level, DI_LSD at the reference injection,
 # scaled by the injection like every molecule-borne peak) are the lab's and are read off VAL NOC1 as the increment
 # over the twin (scratchpad dropin_fit.py): 1.5 events per profile, median e^3.0 = 20 RFU. Held-out TEST NOC1, peaks
 # above the sample's noise p90 and 3x the stutter law, per profile on allele bins 1.89 -> 2.28 (real 2.37), on bins
@@ -959,11 +915,9 @@ STUT_LT_RANGE = (0.3, 1.7)
 # peaks already matched (3.53 / 3.35). A contaminant is somebody's sample, so their alleles arrive together, several on
 # the same donor's positions, which is exactly what opens a decoy. So an event draws one panel donor who is not a
 # contributor, at a low level, and their alleles stand or drop on their own; the event rate is divided by the alleles
-# an event leaves standing, so the peaks per profile stay at what NOC1 measured. DI_PERSON=0 restores the per-allele
-# draw. Labels are unchanged: drop-in belongs to nobody.
-DI_PERSON = int(os.environ.get("STR_DI_PERSON", "1"))
+# an event leaves standing, so the peaks per profile stay at what NOC1 measured. Labels are unchanged: drop-in belongs
+# to nobody.
 DI_RATE = float(os.environ.get("STR_DI_RATE", "1.5"))
-DI_LMU = float(os.environ.get("STR_DI_LMU", "3.0"))
 DI_LSD = float(os.environ.get("STR_DI_LSD", "0.5"))
 DI_HSD = float(os.environ.get("STR_DI_HSD", "0.9"))      # per-allele scatter inside one contaminating sample
 # In person mode the level is the CONTAMINANT's own level, not the height of what shows: only its tall tail clears AT,
@@ -1108,8 +1062,7 @@ if _SSF.exists() and int(os.environ.get("STR_STUT_SPREAD", "1")):
 def _ph_band(h, edges):
     """index of the parent-height band each parent falls in (STUT_PH)"""
     return np.clip(np.digitize(np.asarray(h, float), edges) - 1, 0, len(edges) - 2)
-KAPPA_FIX = None
-_KO_OCC_TOTAL = 0      # DIAGNOSTIC: read the crowding curve with the old total-peak abscissa
+
 _INJ_STEP = {tuple(float(_x) for _x in _k.split("|")): tuple(_v)
              for _k, _v in (cal("inj_step", {}) or {}).items()}
 
@@ -1265,7 +1218,6 @@ def _amp_split(q):
         return 0.0, max(float(q), 0.0)
     m = (1.0 - float(np.sqrt(max(1.0 - 4.0 * d * float(q), 0.0)))) / (2.0 * d)
     return r * m, (1.0 - r) * m
-AMP_PRODUCT = os.environ.get("STR_AMP_PRODUCT", "1") == "1"
 
 INJ_REF = float(cal('inj_ref', 15.0))
 
@@ -1377,7 +1329,7 @@ def _clean_level(rng):
 
 def _relottery(x, c, rng, tpl=None, cond=None):
     """Draw again WHICH of donor c's alleles this amplification kept, at the source's own rate."""
-    if DONOR_DOSAGE is None or not RELOTTERY:
+    if DONOR_DOSAGE is None:
         return x
     h = np.expm1(np.asarray(x, dtype=np.float64))
     own = DONOR_DOSAGE[c] > 0
@@ -1585,7 +1537,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
     # One loss tendency for the whole sample, on top of the per-allele law: measured over-dispersion
     # of the per-profile dropout rate against binomial on NOC1 untreated.
     _t_in = t_total if (t_given and t_total is not None and t_total > 0) else None
-    if BUDGET_SOLVE and t_given and t_total is not None and t_total > 0:
+    if t_given and t_total is not None and t_total > 0:
         # t_total is an OBSERVED total: it already has the artefacts and the noise floor in it, and it
         # is already net of everything that dropped. So the budget handed to the alleles has to be the
         # one whose SURVIVING mass, plus artefacts, plus floor, comes back to t_total:
@@ -1652,7 +1604,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
     if ng_total is not None and ng_total > 0:
         _ushock = rng.random(int(BIN_LOCUS.max()) + 1)[BIN_LOCUS]
     # Generate-then-filter needs the tube's Q, the template and the injection (see FILTER).
-    _filt = bool(FILTER and q_tube is not None and np.isfinite(q_tube) and ng_total and inj_sec
+    _filt = bool(q_tube is not None and np.isfinite(q_tube) and ng_total and inj_sec
                  and bin_size is not None)
     _FH = np.zeros((k, N_FLAT)); _FHm = np.zeros((k, N_FLAT))
     if _filt:
@@ -1668,7 +1620,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
             if _nc.sum() > 0:
                 _ph = _nc / _nc.sum()
         _kap = (float(kappa) if kappa is not None else
-                float(KAPPA_FIX) if KAPPA_FIX is not None else float(rng.uniform(0.0, KAPPA_MAX)))
+                float(rng.uniform(0.0, KAPPA_MAX)))
         _eff = 2.0 ** (-_kap * (k - 1))                       # one tube, one efficiency (see KAPPA_MAX)
         for _di, (_dc, _dp) in enumerate(zip(donor_cols, _ph)):
             _fr = _filter_contrib(_dc, rng, float(_dp) * float(ng_total), q_tube, cond, inj_sec, bin_size, _s_tube,
@@ -1744,7 +1696,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
                 # first, then impose the target's - the same divide-out-then-impose the locus pattern
                 # already uses, and the same double-count the degradation channel was warned about.
                 _sl = 0.0
-                if DEG_RESET and _nzs.sum() >= 12:
+                if _nzs.sum() >= 12:
                     # fitted on the SAME variable the imposition uses - max(bp-100, 0), not raw bp.
                     # Mixing the two left a third of the double-count in place (slope ratio 1.336).
                     _xb = np.maximum(bin_size[_nzs] - 100.0, 0.0)
@@ -1768,7 +1720,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
         # dynamic range 1.9x, where summing the donors' real single-source runs with nothing modelled
         # at all reads 0.2x and 0.1x. Kept for the pool_clean_all fallback, where the premise still
         # holds and the spread genuinely has to be put back.
-        if (TPL_SPREAD in ("1", "2", "4")) and not _lmatch and _tsh and _tref and t_total > 0:
+        if not _lmatch and _tsh and _tref and t_total > 0:
             # This contributor sits at p of the mixture, i.e. at its OWN template, which is below the
             # reference the source profile was put on. Widen its log spread by the same curve, read
             # backwards, and let the sum move: the boost that falls out IS the minor's lift.
@@ -1795,8 +1747,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
                         _tr = np.polyval(_cf, _xb) - _mu
                 _new = np.exp(_mu + _tr + np.clip(_m, 1.0, 4.0) * (_lh - _mu - _tr))
                 _bo = float(_new.sum() / max(h[_nz].sum(), 1e-12))
-                if TPL_SPREAD in ("1", "4"):
-                    h = h.copy(); h[_nz] = _new / max(_new.sum(), 1e-12)
+                h = h.copy(); h[_nz] = _new / max(_new.sum(), 1e-12)
                 p = float(p) * _bo                          # Jensen boost -> realised share
         # Taken down from a richer rung, the heights also SCATTER more: a fainter template is a noisier lottery. The
         # jitter increment below charges the part that follows height; what a step adds beyond it (AMP_STEP_VAR,
@@ -1842,7 +1793,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
         # excess is exactly one jitter variance. Removing it outright takes the KS from 0.215 to
         # 0.091, but removing it is not right either: the source carries scatter for ITS OWN height
         # and a twin built at another template needs scatter for the TARGET height. So subtract one
-        # and add the other - the same divide-out-then-impose DEG_RESET uses for the slope and _gs2
+        # and add the other - the same divide-out-then-impose used for the degradation slope and _gs2
         # below uses for the capillary term.
         # Charged as an ADDED VARIANCE, not by rescaling the source's realised residual. Rescaling was
         # tried, on the argument that adding can only ever widen - sqrt(s_src^2 + s_add^2) - so the
@@ -1865,38 +1816,35 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
         _cv2 = np.maximum(1.0 / np.maximum(gs, 1e-9)
                           - 1.0 / np.maximum(np.interp(_hsrc / _gain, JIT_H, JIT_SHAPE), 1e-9), 0.0)
         gs = 1.0 / np.maximum(_cv2, 1e-6)
-        if AMP_PRODUCT:
-            # amp_cache holds the realised amplification draw so a second injection of the SAME
-            # product reuses it instead of rolling the dice again - without it the twin re-scattered
-            # every peak, giving sd(log ratio) 0.335 between two injections where NOC1 pairs read
-            # 0.085.
-            # CAP_SD is NOT taken out here and NOT added back below. It used to be: the gamma carried
-            # the whole observed scatter and the capillary share was split off into its own draw, so
-            # that two injections of one product could differ. That split assumes the source supplies
-            # no capillary noise of its own. It does - the source IS a real run, and its heights
-            # already carry the capillary noise of the injection that produced them, so a second draw
-            # counted it twice. Found by feeding a real profile in as its own source and asking what
-            # came back: the pipeline added sd 0.0996 of per-allele scatter to data that already had
-            # it, and removing this draw took that to 0.0746 while every audited statistic held or
-            # improved - retention 0.92x -> 0.91x of the replicate envelope, artefact fraction 0.87x
-            # -> 0.85x, dynamic range 0.89x -> 0.85x, bp slope 1.10x -> 1.07x.
-            _gs2 = gs
-            # Drawn UNCONDITIONALLY even when the cache supplies the answer: skipping the call
-            # would advance the stream by a different amount on the second injection and desync
-            # every draw after it, which is worse than the problem being fixed (sd 0.514 against
-            # 0.335 for no cache at all).
-            _dr = rng.gamma(_gs2, 1.0 / _gs2)
-            _am = amp_cache[di] if (amp_cache is not None and di < len(amp_cache)
-                                    and amp_cache[di] is not None) else None
-            if _am is None:
-                _am = _dr
-                if amp_cache is not None:
-                    while len(amp_cache) <= di:
-                        amp_cache.append(None)
-                    amp_cache[di] = _am
-            h = h * _am
-        else:
-            h = h * rng.gamma(gs, 1.0 / gs)
+        # amp_cache holds the realised amplification draw so a second injection of the SAME
+        # product reuses it instead of rolling the dice again - without it the twin re-scattered
+        # every peak, giving sd(log ratio) 0.335 between two injections where NOC1 pairs read
+        # 0.085.
+        # CAP_SD is NOT taken out here and NOT added back below. It used to be: the gamma carried
+        # the whole observed scatter and the capillary share was split off into its own draw, so
+        # that two injections of one product could differ. That split assumes the source supplies
+        # no capillary noise of its own. It does - the source IS a real run, and its heights
+        # already carry the capillary noise of the injection that produced them, so a second draw
+        # counted it twice. Found by feeding a real profile in as its own source and asking what
+        # came back: the pipeline added sd 0.0996 of per-allele scatter to data that already had
+        # it, and removing this draw took that to 0.0746 while every audited statistic held or
+        # improved - retention 0.92x -> 0.91x of the replicate envelope, artefact fraction 0.87x
+        # -> 0.85x, dynamic range 0.89x -> 0.85x, bp slope 1.10x -> 1.07x.
+        _gs2 = gs
+        # Drawn UNCONDITIONALLY even when the cache supplies the answer: skipping the call
+        # would advance the stream by a different amount on the second injection and desync
+        # every draw after it, which is worse than the problem being fixed (sd 0.514 against
+        # 0.335 for no cache at all).
+        _dr = rng.gamma(_gs2, 1.0 / _gs2)
+        _am = amp_cache[di] if (amp_cache is not None and di < len(amp_cache)
+                                and amp_cache[di] is not None) else None
+        if _am is None:
+            _am = _dr
+            if amp_cache is not None:
+                while len(amp_cache) <= di:
+                    amp_cache.append(None)
+                amp_cache[di] = _am
+        h = h * _am
         contrib_exp[di] = exp_h            # what the template says, before this allele's own draw
         contrib[di] = p * t_total * h
         if _lsrc is not None and _teff and _lsrc > _teff * (1.0 + 1e-9):
@@ -1946,7 +1894,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
         # what the observed total leaves after artefacts and floor, at the reference injection. One factor for
         # the whole tube, so the contributors' relative heights - their copy numbers - stand as drawn.
         _bud = float(_t_in) if _t_in is not None else float(t_total)
-        if BUDGET_SOLVE and _t_in is not None:
+        if _t_in is not None:
             _bud = max((_bud - ART_MASS_N) / (1.0 + ART_MASS_A), 0.05 * _bud)
         _bud = _bud / _gain
         _sc = _bud / max(float(_FH.sum()), 1e-9)
@@ -2116,7 +2064,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
                         if _h0 > 0:                                         # see STUT_LT_H0
                             _shp = np.maximum(parent[j], 1e-3) / _h0
                             _rt = _rt * rng.gamma(_shp, 1.0 / _shp)
-                        if ART_CAP and len(row) > 7 and row[7] > 0:
+                        if len(row) > 7 and row[7] > 0:
                             _rt = np.minimum(_rt, row[7])
                         _pj = parent[j] * _cross(d)[j]
                         np.add.at(art_exp, tgt[j], _pj * np.exp(mu_j))
@@ -2137,18 +2085,6 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
                         np.add.at(mix, tgt[j],
                                   parent[j] * _cross(d)[j] * np.exp(rng.normal(lmu, lsd,
                                                                                size=len(j))))
-    elif STUTTER:
-        parents = list(contrib)
-        for parent in parents:
-            js = np.where((STUTTER_TARGET >= 0) & (parent > 0))[0]
-            if len(js):
-                a = BIN_ALLELE[js].astype(np.float64)
-                sr = np.clip(SR_SLOPE * a + SR_INTERCEPT, 0.01, 0.18) * rng.lognormal(0.0, SR_SIGMA, size=len(js))
-                np.add.at(mix, STUTTER_TARGET[js], SR_SCALE * sr * parent[js])   # stutter: attr=-1
-            jf = np.where((FWD_TARGET >= 0) & (parent > 0))[0]
-            if len(jf):
-                fr = FS_RATE * rng.lognormal(0.0, FS_SIGMA, size=len(jf))
-                np.add.at(mix, FWD_TARGET[jf], fr * parent[jf])
     if art_exp.any():
         # ONE survival decision per bin, on the SUMMED expected height. Slippage is a per-molecule
         # event, so each contributor emits its own product, but the products land in the same bin and
@@ -2237,8 +2173,6 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
         # the mixtures lie on ONE curve (mean |NOC1 - mixture| gap 0.0035 against 0.0067 for total occupancy
         # and 0.0175 for the NOISE_GAIN residual).
         _occ = float((mix >= NOISE_CR_TH).sum())
-        if _KO_OCC_TOTAL:
-            _occ = float((mix >= AT_PC).sum())              # DIAGNOSTIC: the old, mismatched footing
         _col = np.array([np.interp(_occ, NOISE_CR_S, NOISE_CR_M[_b])
                          for _b in range(len(NOISE_CR_H))])
         if _occ > NOISE_CR_S[-1]:
@@ -2249,24 +2183,14 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
         np.add.at(mix, jn, _nh)
     _dir = DI_RATE * (1.0 if dropin is None else float(dropin))
     if _dir > 0 and DONOR_DOSAGE is not None:               # see DI_RATE / DI_PERSON: somebody else's sample
-        if DI_PERSON:
-            _nd = int(rng.poisson(DI_RATE_P * (1.0 if dropin is None else float(dropin))))
-            _pool = [c for c in range(len(DONOR_DOSAGE)) if c not in set(donor_cols)]
-            for _c in rng.choice(_pool, size=_nd, replace=False) if _nd and _nd <= len(_pool) else []:
-                _ob = np.flatnonzero(np.asarray(DONOR_DOSAGE[_c]) > 0)
-                _lv = float(np.exp(rng.normal(DI_LMU_P, DI_LSD)))
-                _hh = _lv * np.asarray(DONOR_DOSAGE[_c], float)[_ob] * np.exp(rng.normal(0.0, DI_HSD, len(_ob)))
-                _st = _ob[_hh >= AT]                        # only what clears detection: a couple of alleles
-                if len(_st): np.add.at(mix, _st, _hh[_hh >= AT] * _gain)
-        else:
-            _nd = int(rng.poisson(_dir))
-            if _nd:
-                _dfreq = np.asarray(DONOR_DOSAGE, float).sum(0)
-                _dloci = np.unique(BIN_LOCUS[_dfreq > 0])
-                for _L in rng.choice(_dloci, size=_nd):
-                    _bins = np.flatnonzero((BIN_LOCUS == _L) & (_dfreq > 0))
-                    _b = int(rng.choice(_bins, p=_dfreq[_bins] / _dfreq[_bins].sum()))
-                    mix[_b] += float(np.exp(rng.normal(DI_LMU, DI_LSD))) * _gain
+        _nd = int(rng.poisson(DI_RATE_P * (1.0 if dropin is None else float(dropin))))
+        _pool = [c for c in range(len(DONOR_DOSAGE)) if c not in set(donor_cols)]
+        for _c in rng.choice(_pool, size=_nd, replace=False) if _nd and _nd <= len(_pool) else []:
+            _ob = np.flatnonzero(np.asarray(DONOR_DOSAGE[_c]) > 0)
+            _lv = float(np.exp(rng.normal(DI_LMU_P, DI_LSD)))
+            _hh = _lv * np.asarray(DONOR_DOSAGE[_c], float)[_ob] * np.exp(rng.normal(0.0, DI_HSD, len(_ob)))
+            _st = _ob[_hh >= AT]                        # only what clears detection: a couple of alleles
+            if len(_st): np.add.at(mix, _st, _hh[_hh >= AT] * _gain)
     if SAT_RFU > 0:
         # The capillary saturates. Nothing above this is ever recorded: NOC1 has no peak past it and
         # real's 1333 mixtures top out at 29069 RFU with none above 30000, while the generator reached
@@ -2332,7 +2256,7 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
     # variation that real data has.
     # The acceptance bands check the OLD path's modelled slope and shares; the filtered path derives both from Q
     # and copy numbers, so it is not rejected against a model it does not use.
-    if _depth < TOL_ITERS and ACCEPT and bin_size is not None and k >= 2 and not _filt:
+    if _depth < TOL_ITERS and bin_size is not None and k >= 2 and not _filt:
         _bad = None
         _liv = mix > 0
         if _liv.sum() >= 20:
@@ -2561,7 +2485,7 @@ def gen_conditioned(cols, pool, rng, bin_size):
     inj = float(rng.choice([5.0, 15.0, 25.0]))
     # The tube's efficiency (KAPPA_MAX) acts on every copy, so it lowers the PCR product - the total signal - by the
     # same factor it lowers the copies that decide presence; drawn here so both see one value.
-    kap = float(KAPPA_FIX) if KAPPA_FIX is not None else float(rng.uniform(0.0, KAPPA_MAX))
+    kap = float(rng.uniform(0.0, KAPPA_MAX))
     slt = float(rng.uniform(*STUT_LT_RANGE))                                   # see STUT_LT_A
     sdi = float(rng.uniform(*DI_RANGE))                                        # see DI_RATE
     spu = float(rng.uniform(*PU_RANGE))                                        # see PU_EMIT
