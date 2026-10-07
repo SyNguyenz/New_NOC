@@ -1,6 +1,6 @@
 # Calibrates the noise-floor crowding law as an increment over the generator (TRAIN NOC1, real vs twin with the law off)
 # and writes data/noise_cr_inc.json, which make_insilico reads (NOISE_CR_*). Fold-specific: re-run for every fold.
-import importlib.util, json, os, re, sys, collections
+import importlib.util, json, os, re, sys
 from pathlib import Path
 import numpy as np
 import kit
@@ -8,8 +8,8 @@ CODE = Path(__file__).resolve().parent; REAL = Path(os.environ.get("STR_DATA_DIR
 os.environ["STR_DATA_DIR"] = str(REAL); sys.path.insert(0, str(CODE))
 sp = importlib.util.spec_from_file_location("mi", CODE / "make_insilico.py")
 MI = importlib.util.module_from_spec(sp); sp.loader.exec_module(MI)
-pool = MI.build_ss_pool(); BSV = MI.build_bin_size(); BS = np.asarray(BSV, float)
-BIDX = MI._BININDEX; NB = MI.N_FLAT; BL = MI.BIN_LOCUS.astype(int); BA = MI.BIN_ALLELE.astype(float)
+pool = MI.build_ss_pool(); BSV = MI.build_bin_size()
+BIDX = MI._BININDEX; NB = MI.N_FLAT; BL = MI.BIN_LOCUS.astype(int)
 UNITS = MI.BIN_UNITS                                  # repeat units (make_insilico.BIN_UNITS)
 g = np.load(REAL / "donor_geno.npy"); gmb = np.load(REAL / "donor_geno_mask.npy").astype(bool)
 TB = np.zeros((45, NB), bool)
@@ -19,12 +19,6 @@ for c in range(45):
             k = BIDX.get((int(round(float(g[c, j, 0]))), round(float(g[c, j, 1]), 1)), -1)
             if k >= 0:
                 TB[c, k] = True
-# stutter partner of each bin: index of the bin one repeat below / above / two below / half step below, same locus
-KEY = {(int(BL[j]), round(float(UNITS[j]), 2)): j for j in range(NB)}
-def nb(j, d):
-    return KEY.get((int(BL[j]), round(float(UNITS[j]) + d, 2)), -1)
-OFF = {"lui -1": -1.0, "tien +1": 1.0, "lui -2": -2.0, "nua buoc": -0.5}
-PART = {n: np.array([nb(j, d) for j in range(NB)]) for n, d in OFF.items()}
 # Writes data/noise_cr_inc.json, read by make_insilico (NOISE_CR_M). Re-run after changing the noise floor.
 # TRAIN NOC1: the crowding law as an INCREMENT. Each real profile against its twin generated with the crowding law off;
 # noise = peaks off every allele and off every product offset (-3..+2, half step). The column is the number of peaks at

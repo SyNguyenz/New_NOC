@@ -75,7 +75,7 @@ def feasible_mask(tokens: np.ndarray, mask: np.ndarray, donor_geno: np.ndarray,
 
 
 if __name__ == "__main__":
-    import os, sys
+    import sys
     from pathlib import Path
     D = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data_insilico_w")
     # Enrich AFTER feasibility filtering. The enriched columns are per-locus RELATIVE quantities

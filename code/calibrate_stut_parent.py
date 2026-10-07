@@ -144,13 +144,6 @@ def separated(ctl, pos, key):
     return ps, float(x[min(np.searchsorted(Gs, 0.5), len(x) - 1)]), wf
 
 
-def direct(pos, key):
-    a = np.array(pos.get(key, []))
-    if len(a) < MIN_N or not (a > 0).any():
-        return None
-    return float((a > 0).mean()), float(np.median(a[a > 0]))
-
-
 def logit(p):
     p = np.clip(p, 0.005, 0.995)
     return np.log(p / (1.0 - p))
