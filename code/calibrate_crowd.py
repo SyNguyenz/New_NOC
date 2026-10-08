@@ -10,7 +10,7 @@ sp = importlib.util.spec_from_file_location("mi", CODE / "make_insilico.py")
 MI = importlib.util.module_from_spec(sp); sp.loader.exec_module(MI)
 pool = MI.build_ss_pool(); BSV = MI.build_bin_size(); BS = np.asarray(BSV, float)
 BIDX = MI._BININDEX; NB = MI.N_FLAT; BL = MI.BIN_LOCUS.astype(int); BA = MI.BIN_ALLELE.astype(float)
-W_ = np.floor(BA + 1e-6); UNITS = W_ + np.round((BA - W_) * 10) / 4.0
+UNITS = MI.BIN_UNITS                                  # repeat units (make_insilico.BIN_UNITS)
 g = np.load(REAL / "donor_geno.npy"); gmb = np.load(REAL / "donor_geno_mask.npy").astype(bool)
 TB = np.zeros((45, NB), bool)
 for c in range(45):
@@ -61,7 +61,6 @@ def split(z, c):
     return float((z >= CR_TH).sum()), np.histogram(nz, HB)[0]
 
 
-# RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 NM = json.load(open(REAL / "meta_sample_names_train.json")); Xs = np.load(REAL / "Xflat_train.npy"); ns = np.load(REAL / "noc_train.npy")
 CR = np.zeros((len(SB) - 1, len(HB) - 1)); CT = np.zeros_like(CR); NN = np.zeros(len(SB) - 1)

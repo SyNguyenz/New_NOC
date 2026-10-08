@@ -9,6 +9,7 @@ if KIT not in _SPEC:
     raise SystemExit(f"STR_KIT={KIT!r} not in {sorted(_SPEC)}")
 TAG = _SPEC[KIT]["tag"]
 GENO_FILE = _SPEC[KIT]["geno"]
+# repeat length (bp) of the loci that are not 4-bp repeats; the suffix of a microvariant allele (12.2) is in bp
 REPEAT_BP = {"D22S1045": 3, "Penta D": 5, "Penta E": 5}
 DYE = {
     "3500_GF29cycles": {"D3S1358": 0, "vWA": 0, "D16S539": 0, "CSF1PO": 0, "TPOX": 0,
@@ -23,6 +24,3 @@ DYE = {
                                 "DYS391": 4, "FGA": 4, "DYS576": 4, "DYS570": 4},
 }[KIT]
 
-
-def unit_scale(locus_name):
-    return 5 if REPEAT_BP.get(locus_name) == 5 else 4

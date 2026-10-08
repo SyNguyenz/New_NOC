@@ -5,7 +5,7 @@ so training (incl. Kaggle, where the raw xlsx is absent) just loads a .npy from 
 For each of the 45 KNOWN donors, emit a padded token set of their reference alleles:
   donor_geno.npy       (C, G, 11) float32   col0=locus_idx, col1=allele_float, col2..10=0 (neutral)
   donor_geno_mask.npy  (C, G)     bool       True = a real reference allele
-Genotype source = RAW data_raw/.../*GF29cycles/*RD14-0003 GF Known Genotypes.xlsx (authoritative).
+Genotype source = the kit's Known Genotypes file in data_raw (kit.GENO_FILE; authoritative).
 
 Usage:  python build_donor_geno.py
 """
@@ -37,9 +37,7 @@ def allele_to_float(s: str):
 
 
 def main():
-    # f = glob.glob("data_raw/**/PROVEDIt_RD14-0003 GF Known Genotypes.xlsx", recursive=True)[0]
     f = glob.glob(f"data_raw/**/{kit.GENO_FILE}", recursive=True)[0]
-    # df = pd.read_excel(f, sheet_name=0)
     df = pd.read_excel(f, sheet_name=0) if f.endswith(".xlsx") else pd.read_csv(f)
     loci_cols = [c for c in df.columns if c in LOCUS_TO_IDX]
 

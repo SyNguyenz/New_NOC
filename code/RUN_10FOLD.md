@@ -27,6 +27,7 @@ Mọi lệnh chạy từ **repo root** (thư mục chứa `code/`).
 | flag | mặc định | tác dụng |
 |---|---|---|
 | `STR_FOLD` | `0` | fold cho `code/preprocess.py` (`preprocess.sh` tự đặt) |
+| `STR_KIT` | `3500_GF29cycles` | kit: `3500_GF29cycles` hoặc `3500_F6C29cycles_hlfrxn` (xem `code/kit.py`); đặt giống nhau cho preprocess và train |
 | `STR_DEVICE` | auto | ép `cuda` / `mps` / `cpu` |
 | `STR_BATCH` | `256` | batch train; card 4 GB dùng `128` |
 | `STR_EPOCHS` / `STR_LR` | `150` / `6e-4` | số epoch / learning rate |
@@ -76,7 +77,7 @@ K=1; python -c "import json;d='data/fold$K';m=json.load(open(d+'/meta_set.json')
 code/
   kaggle_run_increment1.py  train_set_transformer.py  decode_layer.py  gen_law.py  phi_rerank.py
   preprocess.py  make_insilico.py
-  build_donor_geno.py  build_real_attr.py  extract_phi_condition.py  extract_size.py
+  build_donor_geno.py  build_real_attr.py  extract_phi_condition.py  kit.py  kit_raw.py
   calibrate.py  calibrate_*.py
   models/__init__.py  models/ordinal.py  models/set_transformer.py
   features/enrich.py  synth/extract_genotypes.py

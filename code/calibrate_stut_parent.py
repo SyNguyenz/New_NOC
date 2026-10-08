@@ -55,7 +55,6 @@ os.environ.setdefault("STR_DATA_DIR", str(DATA))
 _s = importlib.util.spec_from_file_location("make_insilico", HERE / "make_insilico.py")
 MI = importlib.util.module_from_spec(_s); _s.loader.exec_module(MI)
 
-# RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 OFFS = (-10, 10, -20)                                       # n-1, n+1, n-2
 # Offsets, in REPEAT units, at which an allele can put something that is not floor: stutter at -3..+3 repeats and
@@ -69,7 +68,7 @@ KNOT = np.array([50.0, 141.0, 283.0, 566.0, 1131.0, 2263.0, 4525.0, 9051.0])
 W_MAX = 0.45                                                # floor share above which the separation is not trusted
 MIN_N = 100
 ITERS = int(os.environ.get("STR_STUT_PH_ITERS", "8"))
-_W = np.floor(MI.BIN_ALLELE + 1e-6); UN = _W + np.round((MI.BIN_ALLELE - _W) * 10) / 4.0
+UN = MI.BIN_UNITS                                     # repeat units (make_insilico.BIN_UNITS)
 BL = np.asarray(MI.BIN_LOCUS, int)
 
 

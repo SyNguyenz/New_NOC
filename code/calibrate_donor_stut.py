@@ -37,7 +37,6 @@ os.environ.setdefault("STR_DATA_DIR", str(DATA))
 _s = importlib.util.spec_from_file_location("make_insilico", HERE / "make_insilico.py")
 MI = importlib.util.module_from_spec(_s); _s.loader.exec_module(MI)
 
-# RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)GF-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 RX = re.compile(r"RD\d+-\d+-(\d+)d(\d+)([A-Za-z0-9\-]*?)-([\d.]+)" + kit.TAG + r"-Q([\d.]+)_\d+\.(\d+)\s*sec", re.I)
 H_MIN = 600.0
 MIN_N = 8
@@ -45,7 +44,7 @@ K_PSEUDO = 5.0                                          # runs of prior weight o
 BPOFF = np.array([-0.75, -0.5, -0.25, 0.25, 0.5, 0.75])
 OWN = np.asarray(MI.DONOR_DOSAGE) > 0
 BL = np.asarray(MI.BIN_LOCUS, int)
-_W = np.floor(MI.BIN_ALLELE + 1e-6); UN = _W + np.round((MI.BIN_ALLELE - _W) * 10) / 4.0
+UN = MI.BIN_UNITS                                     # repeat units (make_insilico.BIN_UNITS)
 
 
 def specs():

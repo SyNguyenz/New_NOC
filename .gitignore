@@ -47,3 +47,4 @@ code/data*/
 data_raw/
 _archive_*/
 kaggle_upload/
+*.fromxlsx.csv

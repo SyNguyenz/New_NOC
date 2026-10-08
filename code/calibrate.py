@@ -258,12 +258,7 @@ def _art_rarity(ctx, ss, tok, mk, y, key, tabl, EH, SP, edges):
 # observable context: a peak is deleted with certainty when a peak in ANOTHER dye channel within 0.5 bp stands
 # 20x or more taller, in part at 10-20x or 0.5-2 bp, and almost never below 10x. True alleles of NOC1 and of the
 # mixtures follow the same table as the artefacts it was read from. Pull-up is spectral bleed-through, so the
-# context is sought only across channels; each marker's channel is GlobalFiler's own panel.
-GF_DYE = {"D3S1358": 0, "vWA": 0, "D16S539": 0, "CSF1PO": 0, "TPOX": 0,
-          "Yindel": 1, "AMEL": 1, "D8S1179": 1, "D21S11": 1, "D18S51": 1,
-          "DYS391": 2, "D2S441": 2, "D19S433": 2, "TH01": 2, "FGA": 2,
-          "D22S1045": 3, "D5S818": 3, "D13S317": 3, "D7S820": 3, "SE33": 3,
-          "D10S1248": 4, "D1S1656": 4, "D12S391": 4, "D2S1338": 4}
+# context is sought only across channels; each marker's channel comes from the kit's panel (kit.DYE).
 PULL_R_EDGES = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0, 300.0, 1e12]
 PULL_D_EDGES = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
 PULL_H_GRID = np.exp(np.linspace(0.0, np.log(30000.0), 25))
@@ -272,7 +267,6 @@ PULL_H_GRID = np.exp(np.linspace(0.0, np.log(30000.0), 25))
 def pull_neighbours(bin_locus, locus_names, bsz, win=2.0):
     """Per bin, the bins of OTHER dye channels within win bp of it (bin median sizes), padded with an index
     one past the last bin (height 0) and distance 99."""
-    # dye = np.array([GF_DYE.get(locus_names[int(L)], -1) for L in bin_locus])
     dye = np.array([kit.DYE.get(locus_names[int(L)], -1) for L in bin_locus])
     n = len(bsz); ks = []
     for j in range(n):
@@ -317,7 +311,6 @@ def _pull_table(ctx, want, nb, nd, bidx, loci):
     li = {name: i for i, name in enumerate(loci)}
     H = {"UnF": {}, "F": {}}
     for tag, sub in (("UnF", "PROVEDIt_1-5-Person CSVs UnFiltered"), ("F", "PROVEDIt_1-5-Person CSVs Filtered")):
-        # for f in _glob.glob(str(raw / sub / "*GF29cycles" / "**" / "*.csv"), recursive=True):
         for f in [g for g in _glob.glob(str(raw / sub / f"*{kit.KIT}" / "**" / "*.csv"), recursive=True) if "Known Genotypes" not in g]:
             with open(f, newline="", encoding="utf-8-sig", errors="replace") as fh:
                 rd = _csv.reader(fh); head = next(rd)
@@ -1358,7 +1351,7 @@ def derive(ctx) -> dict:
         out["treat_conv"] = _tc
     except Exception:
         pass
-    # PULL-UP: the rule and the NOC1 baseline it leaves in every emission rate (see GF_DYE above).
+    # PULL-UP: the rule and the NOC1 baseline it leaves in every emission rate (see kit.DYE).
     try:
         import json as _js2
         _loci = sorted(_js2.load(open(ctx.DATA / "meta_set.json"))["locus_to_idx"].items(), key=lambda kv: kv[1])
@@ -1468,7 +1461,6 @@ def derive(ctx) -> dict:
             byl = {}
             for a5 in key[c]:
                 byl.setdefault(a5[0], []).append(a5)
-            # v5 = np.array([sum(hm5.get(z, 0.0) for z in byl.get(L, [])) for L in range(24)])
             v5 = np.array([sum(hm5.get(z, 0.0) for z in byl.get(L, [])) for L in range(int(ctx.BIN_LOCUS.max()) + 1)])
             if (v5 > 0).sum() >= 20:
                 lv = np.log(np.where(v5 > 0, v5, np.nan))
@@ -1796,7 +1788,6 @@ def derive(ctx) -> dict:
             mu_ = float(np.mean(list(w_.values())))
             # Keyed by TREATMENT and template band. Injection only moves the profile's level, which
             # the per-profile centring above already removes; treatment bends the pattern itself.
-            # _mt = _re.search(r"RD14-0003-\d+d\d([A-Za-z0-9\-]*?)-[0-9.]+GF", str(names[i]))
             _mt = _re.search(r"RD14-0003-\d+d\d([A-Za-z0-9\-]*?)-[0-9.]+" + kit.TAG, str(names[i]))
             _tt = (_mt.group(1).strip("-") or "a") if _mt else "a"
             _tr = (_tt, int(np.searchsorted(_tb, float(ng[i]), "right")) - 1)

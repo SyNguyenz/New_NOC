@@ -23,6 +23,8 @@ Usage: bash preprocess.sh [--override] <fold> [<fold> ...]
 Each fold is rebuilt from data_raw by code/preprocess.py (~30 min per fold) and its
 data_insilico_w is copied to data/foldK. Logs go to data/logs/foldK.log.
 Python: \$PY if set, else venv/, else python3 / python.
+Kit: STR_KIT (default 3500_GF29cycles), e.g. STR_KIT=3500_F6C29cycles_hlfrxn bash preprocess.sh 0
+  (data/foldK is per run - keep different kits apart).
 EOF
 }
 

@@ -70,7 +70,6 @@ RE_RATIO = re.compile(r"-(\d+(?:[;:]\d+)+)-M")          # mixture ratio, anchore
 RE_MBLOCK = re.compile(r"-M\d+([A-Za-z]*)(\d*)")        # mixture condition  -M<dil><code><level>
 RE_DBLOCK = re.compile(r"d\d+([A-Za-z]+)(\d*)")         # single-source condition <id>d<dil><code><level>
 RE_FRAG = re.compile(r"d\d+-(\d{2})-")                  # fragmentase single-source  d1-15-
-# RE_TEMPLATE = re.compile(r"-([\d.]+)(?:GF|IP|PP)\b")
 RE_TEMPLATE = re.compile(r"-([\d.]+)(?:GF|IP|PP|F6C)\b")    # template mass ng  -0.21GF
 RE_QINDEX = re.compile(r"-Q([\d.]+)")                   # PROVEDIt quality index -Q0.9
 
