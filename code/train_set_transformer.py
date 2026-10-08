@@ -212,15 +212,12 @@ def evaluate_oracle_em(model, loader):
 # ── owner_lut / cn_lut (carrier + copy-number LUTs from reference genotypes) ──
 def build_luts(donor_geno, donor_geno_mask, n_cls):
     gg = donor_geno; gm = donor_geno_mask.bool()
-    # owner = torch.zeros(24, LUT_W, n_cls)
     owner = torch.zeros(CFG["n_loci"], LUT_W, n_cls)
-    # cn = torch.zeros(24, LUT_W, n_cls)
     cn = torch.zeros(CFG["n_loci"], LUT_W, n_cls)
     for c in range(min(n_cls, gg.size(0))):
         for j in range(gg.size(1)):
             if gm[c, j]:
                 li = int(gg[c, j, 0]); ab = int(round(float(gg[c, j, 1]) * 10)) + ALLELE_OFF
-                # if 0 <= li < 24 and 0 <= ab < LUT_W:
                 if 0 <= li < CFG["n_loci"] and 0 <= ab < LUT_W:
                     owner[li, ab, c] = 1.0
                     cn[li, ab, c] += 1.0                       # accumulate: 2 for homozygous
@@ -240,7 +237,6 @@ def train(seed: int, out_subdir: str):
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, generator=gen,
                               num_workers=0, pin_memory=(DEVICE.type == "cuda"))
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
     sel_loader = val_loader
     print(f"selection set = val ({len(val_ds)} samples: real NOC1 + combo-disjoint in-silico mixtures)")
 
@@ -287,7 +283,6 @@ def train(seed: int, out_subdir: str):
     mask_peaks_p = cfg["mask_peaks"]; mask_min = cfg["mask_peaks_min"]
 
     def gather_owner(tok):
-        # loc = tok[:, :, 0].long().clamp(0, 23)
         loc = tok[:, :, 0].long().clamp(0, CFG["n_loci"] - 1)
         ab = (torch.round(tok[:, :, 1] * 10).long() + ALLELE_OFF).clamp(0, owner_lut.size(1) - 1)
         return owner_lut[loc, ab]
@@ -335,7 +330,6 @@ def train(seed: int, out_subdir: str):
             loss_attr_v = 0.0
             if (attr >= 0).any():
                 la = out["logits_attr"]
-                # li_ = tokens[..., 0].long().clamp(0, 23)
                 li_ = tokens[..., 0].long().clamp(0, CFG["n_loci"] - 1)
                 bi_ = (tokens[..., 1] * 10).round().long() + ALLELE_OFF
                 bi_ = bi_.clamp(0, cn_lut.size(1) - 1)
