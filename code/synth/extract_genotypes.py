@@ -80,7 +80,6 @@ def extract_genotypes():
     locus_to_idx = meta["locus_to_idx"]
     known_donors = meta["known_donors"]      # 45 donors
 
-    train_names = load_names("train")
     tokens_train = np.load(DATA / "tokens_train.npy")   # (N, 160, 3)
     mask_train   = np.load(DATA / "mask_train.npy")     # (N, 160)
     noc_train    = np.load(DATA / "noc_train.npy")      # (N,)
@@ -204,7 +203,6 @@ def qc_against_real(df: pd.DataFrame):
     phai nam trong union genotype cac donor thanh phan.
     """
     meta         = load_meta()
-    loci         = meta["loci"]
     locus_to_idx = meta["locus_to_idx"]
     idx_to_locus = {v: k for k, v in locus_to_idx.items()}
     known_donors = meta["known_donors"]
@@ -264,7 +262,7 @@ def qc_against_real(df: pd.DataFrame):
                     })
 
     coverage = 1.0 - len(all_missing) / max(total_checked, 1)
-    print(f"\n=== QC: Real mixture allele coverage ===")
+    print("\n=== QC: Real mixture allele coverage ===")
     print(f"Total allele observations checked: {total_checked}")
     print(f"Missing from consensus genotype  : {len(all_missing)}")
     print(f"Coverage: {coverage*100:.2f}%")
