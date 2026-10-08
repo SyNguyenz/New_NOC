@@ -79,7 +79,7 @@ code/
   preprocess.py  make_insilico.py
   build_donor_geno.py  build_real_attr.py  extract_phi_condition.py  kit.py  kit_raw.py
   calibrate.py  calibrate_*.py
-  models/__init__.py  models/ordinal.py  models/set_transformer.py
+  models/__init__.py  models/set_transformer.py
   features/enrich.py  synth/extract_genotypes.py
 ```
 

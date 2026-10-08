@@ -21,7 +21,7 @@ vib, mass_pool, vicreg, donor_recon, query_denoise, noc_contrast/noc_ord, sic, t
 `cardinality_head`, the `hybrid`/`pooled` heads, the decoder_source raw/local branches, …).
 
 BIT-IDENTICAL guarantee (checked when it was extracted): the parameter NAMES and the forward computation of the
-RANKING heads (logits_cls / logits_card / logits_attr) match the original
+RANKING heads (logits_cls / logits_attr) match the original
 `SetTransformerMixture` for the inc22 config.
 
 Classes/functions copied verbatim from models/set_transformer.py:
@@ -188,9 +188,9 @@ def sinkhorn_log(affinity: torch.Tensor, pad_mask: torch.Tensor,
 class AdaptiveSlotDecoder(nn.Module):
     """Slots = panel donors (K=45).  CoSA geno init -> GSANet attr-guided refine -> MESH Sinkhorn-OT
     slot-attention loop -> AdaSlot Gumbel-Sigmoid existence gate.  logits_cls = cls_head(slots) +
-    gate_logit; logits_card = noc_head(gate)."""
+    gate_logit."""
 
-    def __init__(self, d_model: int, n_classes: int = 45, n_noc: int = 5,
+    def __init__(self, d_model: int,
                  n_iters: int = 3, ot_eps: float = 0.05, ot_iters: int = 5,
                  gumbel_temp: float = 1.0, dropout: float = 0.1):
         super().__init__()
@@ -218,11 +218,10 @@ class AdaptiveSlotDecoder(nn.Module):
 
         self.gate_head = nn.Linear(d_model, 1)                              # AdaSlot slot-existence
         self.cls_head  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))  # content
-        self.noc_head = nn.Linear(n_classes, n_noc)
 
     def forward(self, H: torch.Tensor, pad_mask: torch.Tensor, geno_slots: torch.Tensor,
                 attr_logits: torch.Tensor | None = None) -> dict:
-        B, N, d = H.shape
+        B, _, d = H.shape
         K = geno_slots.shape[1]
 
         # 1. CoSA: genotype-conditioned slot init
@@ -261,14 +260,11 @@ class AdaptiveSlotDecoder(nn.Module):
         # 5. logits_cls = content + existence in logit space
         cls_raw    = self.cls_head(slots).squeeze(-1)
         logits_cls = cls_raw + gate_logit
-        logits_card = self.noc_head(gate)                              # (B, n_noc)
 
         return {
             "logits_cls":  logits_cls,
-            "logits_card": logits_card,
             "gate":        gate,
             "gate_logit":  gate_logit,
-            "attn":        A,
         }
 
 
@@ -311,7 +307,7 @@ class SetTransformerMixture(nn.Module):
 
         # aslot decoder + CoSA genotype buffers/projection (registered exactly as in the original)
         self.cls_decoder_module = AdaptiveSlotDecoder(
-            d_model, n_classes=n_classes, n_noc=5,
+            d_model,
             n_iters=n_slot_iters, ot_eps=ot_eps, ot_iters=ot_iters,
             gumbel_temp=gumbel_temp, dropout=dropout,
         )
@@ -357,7 +353,7 @@ class SetTransformerMixture(nn.Module):
         return self.geno_proj(emb)                                    # zero-init -> 0 at start
 
     def _encode_set(self, tokens, mask):
-        """Returns (x0, H, pad_mask).  set_of_set: split peaks into private (n_car==1) / shared
+        """Returns (H, pad_mask).  set_of_set: split peaks into private (n_car==1) / shared
         (n_car!=1) BEFORE the encoder; each set passes the SAME ISAB++ independently, then merge."""
         x0, pad_mask = self._project_tokens(tokens, mask)
         li = tokens[..., 0].long().clamp(0, self.n_loci - 1)
@@ -378,11 +374,11 @@ class SetTransformerMixture(nn.Module):
             H_shar = isab(H_shar, pad_mask=shar_pm)
         H_shar = H_shar * is_shar.unsqueeze(-1).to(H_shar.dtype)
         H = H_priv + H_shar                                           # disjoint -> clean selection
-        return x0, H, pad_mask
+        return H, pad_mask
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> dict[str, torch.Tensor]:
         """inc22 forward = the _forward_aslot path of SetTransformerMixture."""
-        x0, H, pad_mask = self._encode_set(tokens, mask)
+        H, pad_mask = self._encode_set(tokens, mask)
         B = tokens.size(0)
 
         geno_e = self._encode_geno()                                  # (K, d)
@@ -393,7 +389,6 @@ class SetTransformerMixture(nn.Module):
 
         out = {
             "logits_cls":   slot_out["logits_cls"],
-            "logits_card":  slot_out["logits_card"],
             "logits_attr":  attr_raw,
         }
         out["gate"] = slot_out["gate"]

@@ -43,8 +43,6 @@ GRID_F2 = (0.1, 0.3, 0.5, 0.9)
 GRID_B = (16.0, 32.0, 64.0, 128.0)
 GRID_ALPHA = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0)
 OPEN_ACCEPT = 0.95             # share of val the open threshold accepts
-OPEN_FEATURES = ("attr background share", "off-panel height share", "unexplained after the decoded set",
-                 "sum of gates", "6th largest gate", "-log k-th gate")
 
 
 def _key(locus, allele):
@@ -303,7 +301,8 @@ def apply(split, cfg):
 
 # ── open score ───────────────────────────────────────────────────────────────
 def open_features(split, k):
-    """(N, 6) panel-fit features (OPEN_FEATURES), each larger when a person outside the panel is present"""
+    """(N, 6) panel-fit features, each larger when a person outside the panel is present: attr background share,
+    off-panel height share, unexplained after the decoded set, sum of gates, 6th largest gate, -log k-th gate"""
     law = split.law; lw = _Law(law); T, M, G = split.tokens, split.mask, split.G
     panel = {_key(split.dg[c, j, 0], split.dg[c, j, 1]) for c in range(split.dg.shape[0])
              for j in range(split.dg.shape[1]) if split.dgm[c, j]}

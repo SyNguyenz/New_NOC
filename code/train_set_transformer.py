@@ -72,12 +72,10 @@ CFG = {
     "n_loci": 24, "d_locus": 16, "d_model": 128, "n_heads": 4, "n_isab": 2, "m_inducing": 32,
     "n_classes": 45, "dropout": 0.1,
     "lr": 6e-4, "weight_decay": 1e-4, "batch_size": 256, "epochs": 150,   # no early stopping
-    "n_token_feats": 8, "num_embed": "periodic", "periodic_sigma": 0.3, "n_freq": 8, "d_num_emb": 8,
-    "encoder": "isab++", "nc_attn": "mab0", "cls_decoder": "aslot",
-    "aux_heads": True, "set_of_set": True, "feas_filter": True, "soft_attr_label": True,
+    "n_token_feats": 8, "periodic_sigma": 0.3, "n_freq": 8, "d_num_emb": 8,
     "mask_peaks": 0.15, "mask_peaks_min": 8,
     "n_slot_iters": 3, "ot_eps": 0.05, "ot_iters": 5, "gumbel_temp": 1.0,
-    "loss": "asl", "asl_gamma_neg": 4.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
+    "asl_gamma_neg": 4.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
     "w_gate": 0.05,            # weight on SmoothL1(sum gate, NOC)
 }
 # Warm start + schedule overrides, for finetuning an existing checkpoint on a new data mix without
@@ -87,7 +85,7 @@ CFG = {
 INIT_FROM = os.environ.get("STR_INIT_FROM", "").strip()
 # STR_EVAL_ONLY=1: no training - load STR_INIT_FROM and run the test-time decode/eval exactly as after training.
 EVAL_ONLY = os.environ.get("STR_EVAL_ONLY", "0") == "1"
-if (DATA_DIR / "meta_set.json").exists():
+if (DATA_DIR / "meta_set.json").exists():                    # the kit decides how many loci there are
     CFG["n_loci"] = len(json.load(open(DATA_DIR / "meta_set.json"))["loci"])
 CFG["epochs"] = int(os.environ.get("STR_EPOCHS", CFG["epochs"]))
 CFG["lr"] = float(os.environ.get("STR_LR", CFG["lr"]))
