@@ -5,7 +5,6 @@ train_set_transformer.py — trainer + test-time decode for the set-transformer 
              set_of_set, feas_filter). See models/set_transformer.py.
   * loss   = ASL(gamma_neg=4) on logits_cls
              + 0.05 * SmoothL1(sum gate, NOC)                   (the live AdaSlot slots ARE the count)
-             + 0.3 * CORN(noc_head_v2)                          (detached inputs; trained, never decoded)
              + Kendall( soft_attr_label CE )                    (aux_heads, soft_attr_label)
   * train aug = mask_peaks 0.15 on shared peaks (private peaks are never masked)
   * selection = macro-over-NOC oracle Recall@k on the val split. No early stopping;
@@ -42,7 +41,6 @@ from sklearn.metrics import f1_score, roc_auc_score
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from models.set_transformer import SetTransformerMixture
-from models.ordinal import corn_loss
 import decode_layer as DL
 import gen_law as gl
 
@@ -80,14 +78,6 @@ CFG = {
     "mask_peaks": 0.15, "mask_peaks_min": 8,
     "n_slot_iters": 3, "ot_eps": 0.05, "ot_iters": 5, "gumbel_temp": 1.0,
     "loss": "asl", "asl_gamma_neg": 4.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
-    # CORN ordinal count head on DETACHED features. Decode never reads it, but the published run
-    # trained with it and its gradient enters the global clip_grad_norm_ denominator; dropping it
-    # measurably hurt (EM .9162 vs .9260, count error 5.37% vs 3.74%).
-    "noc_head_v2": True, "noc_v2_weight": 0.3,
-    # tier B: the number of live AdaSlot slots IS the count. Fold 0 — corr(sum gate, NOC) flips
-    # -0.966 -> +0.980, median sum(gate) lands on 1/2/3/4/5, and the tier-A readout on that backbone
-    # reaches count .9414 (vs .9361) with ID oracle unharmed. gate is NOT detached and feeds
-    # logits_cls via gate_logit, so this reaches the encoder — that is the point.
     "w_gate": 0.05,            # weight on SmoothL1(sum gate, NOC)
 }
 # Warm start + schedule overrides, for finetuning an existing checkpoint on a new data mix without
@@ -243,7 +233,7 @@ def train(seed: int, out_subdir: str):
     results_dir.mkdir(parents=True, exist_ok=True)
     gen = set_seed(seed)
     print(f"seed={seed}  data={DATA_DIR}  device={DEVICE}")
-    print(f"w_gate={cfg['w_gate']}  noc_head_v2={cfg['noc_head_v2']}  mask_peaks={cfg['mask_peaks']}")
+    print(f"w_gate={cfg['w_gate']}  mask_peaks={cfg['mask_peaks']}")
 
     train_ds = ClosedSetDataset("train"); val_ds = ClosedSetDataset("val")
     test_ds = ClosedSetDataset("test"); open_ds = OpenSetDataset()
@@ -271,7 +261,6 @@ def train(seed: int, out_subdir: str):
         periodic_sigma=cfg["periodic_sigma"], n_slot_iters=cfg["n_slot_iters"], ot_eps=cfg["ot_eps"],
         ot_iters=cfg["ot_iters"], gumbel_temp=cfg["gumbel_temp"],
         donor_geno=donor_geno, donor_geno_mask=donor_geno_mask, owner_lut=owner_lut,
-        noc_head_v2=cfg["noc_head_v2"],
     ).to(DEVICE)
     # per-feature standardization from train valid peaks (enriched tokens)
     _tk = train_ds.tokens.numpy(); _mk = train_ds.mask.numpy().astype(bool)
@@ -286,14 +275,11 @@ def train(seed: int, out_subdir: str):
     # ── Loss objects + weights ────────────────────────────────────────────────
     bce_cls = AsymmetricLoss(gamma_neg=cfg["asl_gamma_neg"], gamma_pos=cfg["asl_gamma_pos"], clip=cfg["asl_clip"])
     w_gate = float(cfg["w_gate"])
-    noc_v2_w = float(cfg["noc_v2_weight"])
     # Kendall homoscedastic-uncertainty weights for the privileged aux losses
     log_var_attr = torch.zeros((), device=DEVICE, requires_grad=True)
-    # log_var_phi  = torch.zeros((), device=DEVICE, requires_grad=True)
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                                   lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    # optimizer.add_param_group({"params": [log_var_attr, log_var_phi], "weight_decay": 0.0})
     optimizer.add_param_group({"params": [log_var_attr], "weight_decay": 0.0})
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
                                                            patience=5, min_lr=1e-6)
@@ -318,7 +304,7 @@ def train(seed: int, out_subdir: str):
 
     for epoch in range(1, epochs + 1):
         model.train()
-        epoch_loss = epoch_cls = epoch_attr = epoch_phi = 0.0
+        epoch_loss = epoch_cls = epoch_attr = 0.0
         for tokens, mask, y, noc, attr, phi, frac, fcol in train_loader:
             tokens, mask = tokens.to(DEVICE), mask.to(DEVICE)
             y, noc = y.to(DEVICE), noc.to(DEVICE); attr = attr.to(DEVICE); phi = phi.to(DEVICE)
@@ -339,21 +325,14 @@ def train(seed: int, out_subdir: str):
             loss_cls = bce_cls(out["logits_cls"], y)
 
             loss = loss_cls
-
-            # CORN count head on TRUE noc (noc_head_v2). Inputs are detached, so this adds no
-            # encoder gradient — but it DOES add gradient mass to clip_grad_norm_, exactly as in
-            # the published arm. Decode ignores logits_count_v2.
-            if cfg["noc_head_v2"] and "logits_count_v2" in out:
-                loss = loss + noc_v2_w * corn_loss(out["logits_count_v2"], noc.clamp(1, 5), 5)
-
             # tier B: the number of live AdaSlot slots IS the count. Unlike every other count path
             # here, `gate` is NOT detached — this term reaches the encoder through gate_logit.
             if w_gate > 0:
                 loss = loss + w_gate * F.smooth_l1_loss(
                     out["gate"].sum(1), noc.clamp(1, 5).to(out["gate"].dtype))
 
-            # privileged aux: soft_attr_label CE (EuroForMix phi*CN soft labels) + L1 phi, Kendall-weighted
-            loss_attr_v = loss_phi_v = 0.0
+            # privileged aux: soft_attr_label CE (EuroForMix phi*CN soft labels), Kendall-weighted
+            loss_attr_v = 0.0
             if (attr >= 0).any():
                 la = out["logits_attr"]
                 # li_ = tokens[..., 0].long().clamp(0, 23)
@@ -382,10 +361,6 @@ def train(seed: int, out_subdir: str):
                 raw_l_ = -(soft_y_ * log_p_).sum(-1)
                 vm_ = mask.bool().float()
                 loss_attr = (raw_l_ * vm_).sum() / vm_.sum().clamp(min=1)
-                # loss_phi = F.l1_loss(out["phi"], phi)
-                # loss = loss + (torch.exp(-log_var_attr) * loss_attr + log_var_attr
-                #                + torch.exp(-log_var_phi) * loss_phi + log_var_phi)
-                # loss_attr_v = loss_attr.item(); loss_phi_v = loss_phi.item()
                 loss = loss + torch.exp(-log_var_attr) * loss_attr + log_var_attr
                 loss_attr_v = loss_attr.item()
 
@@ -396,7 +371,7 @@ def train(seed: int, out_subdir: str):
 
             bs = len(tokens)
             epoch_loss += loss.item() * bs; epoch_cls += loss_cls.item() * bs
-            epoch_attr += loss_attr_v * bs; epoch_phi += loss_phi_v * bs
+            epoch_attr += loss_attr_v * bs
 
         n = len(train_ds); epoch_loss /= n
         val_f1 = evaluate_closed(model, val_loader)
@@ -407,7 +382,7 @@ def train(seed: int, out_subdir: str):
                         "val_oracle_em": round(val_em, 4), "val_macro_recall": round(val_macrec, 4)})
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Ep {epoch:3d} | loss={epoch_loss:.4f} (cls={epoch_cls/n:.3f} "
-                  f"attr={epoch_attr/n:.3f} phi={epoch_phi/n:.3f}) "
+                  f"attr={epoch_attr/n:.3f}) "
                   f"| DEV macrec={val_macrec:.4f} em={val_em:.4f} f1={val_f1:.4f} "
                   + f"| lr={optimizer.param_groups[0]['lr']:.1e}")
 
