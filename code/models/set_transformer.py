@@ -295,7 +295,7 @@ class SetTransformerMixture(nn.Module):
         self.n_token_feats = n_token_feats
 
         # owner_lut carrier LUT (set_of_set / feas_filter / count features) — registered buffer.
-        self.register_buffer("owner_lut", owner_lut.float())           # (24, LUT_W, C)
+        self.register_buffer("owner_lut", owner_lut.float())           # (n_loci, LUT_W, C)
 
         n_num = n_token_feats - 1
         self.locus_embed = nn.Embedding(n_loci + 1, d_locus, padding_idx=n_loci)
