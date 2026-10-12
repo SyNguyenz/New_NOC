@@ -291,11 +291,13 @@ def csv_pass():
         "combo_list": [[int(d) for d in c] for c in all_combos],
         "split_policy": {
             "description": (
-                "Single-source (NOC=1): stratified by donor (all 45 donors in every split). "
-                "Multi-person (NOC>=2): EVERY closed donor-combo goes to test — the network trains "
-                "on in-silico mixtures only, so no real combo is spent on train/val, and all of them "
-                "are excluded from in-silico generation. The post-hoc decode is fit leave-one-combo-out "
-                "via combo_id_test.npy. val is single-source only."),
+                "Single-source (NOC=1): split by PCR tube (the injections of one amplification stay in one "
+                "split), stratified by donor so all 45 panel donors are in every split. "
+                "Multi-person (NOC>=2): EVERY real mixture of panel donors goes to test; the network trains "
+                "on in-silico mixtures only, and no real test combo is used to generate them. "
+                "Validation = real single-source val + 15% of the in-silico donor combos (held out by "
+                "make_insilico); every post-hoc decode parameter and the open-set threshold are chosen on it. "
+                "Profiles with an unknown donor form the open split, used for test only."),
             "multi_person_combos": split_policy_combos,
         },
     }

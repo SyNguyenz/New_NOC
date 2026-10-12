@@ -89,12 +89,25 @@ Objective (closed set only; the open split is never trained on): `ASL(γ_neg=4)`
 The eval prints COUNT (sum-of-gates and decoded k), ID (at the true k and at the decoded k) and OPEN SET reports,
 each with per-class precision / recall / F1 and macro / micro averages.
 
-## Fold 0 result (`code/results/dgw_ref_seed42`)
+## Results (10 folds, mean ± SD)
 
-v3 (`results/inc22_v3_seed42`, 150 epochs) fine-tuned 3 epochs on `data_dgw` (12k, seed 7), decode as above
-(chosen then on the old in-silico DEV split: α .2, t .0299, u_min .1, a 16, f2_min .3, b 32):
+GlobalFiler (3500, 29 cycles). 10 donor-disjoint folds, each holding out 5 of the 50 donors; trained on
+in-silico mixtures and real single-source profiles only; tested on every real profile (25,154 in total,
+14,093 of them mixtures).
 
-| | macro ID (NOC2-5) | macro count | NOC2 | NOC3 | NOC4 | NOC5 |
-|---|---|---|---|---|---|---|
-| in-silico DEV (old split) | .873 | | | | | |
-| real test | .933 | .950 | .961 | .974 | .967 | .828 |
+| task | metric | result |
+|---|---|---|
+| Count (NOC) | macro F1, NOC1–5 | 0.9403 ± 0.0101 |
+| | accuracy | 0.9603 ± 0.0083 |
+| Identification | macro F1 over donors, mixtures | 0.9838 ± 0.0028 |
+| | exact donor set, macro NOC2–5 | 0.9042 ± 0.0145 |
+| | exact donor set at the decoded k (all NOC) | 0.9487 ± 0.0098 |
+| | exact donor set at the true k (all NOC) | 0.9777 ± 0.0050 |
+| Open set | AUROC | 0.8811 ± 0.0295 |
+| | open samples flagged / closed samples flagged | 0.627 ± 0.091 / 0.095 ± 0.010 |
+
+| | NOC1 | NOC2 | NOC3 | NOC4 | NOC5 |
+|---|---|---|---|---|---|
+| count F1 | 0.9973 ± 0.0008 | 0.9649 ± 0.0053 | 0.9318 ± 0.0178 | 0.9078 ± 0.0264 | 0.9000 ± 0.0267 |
+| exact donor set, decoded k | 0.9932 ± 0.0012 | 0.9408 ± 0.0101 | 0.9355 ± 0.0248 | 0.9450 ± 0.0175 | 0.7954 ± 0.0470 |
+| exact donor set, true k | 0.9949 ± 0.0010 | 0.9955 ± 0.0036 | 0.9851 ± 0.0072 | 0.9727 ± 0.0120 | 0.8675 ± 0.0231 |
