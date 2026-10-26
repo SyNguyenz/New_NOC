@@ -345,6 +345,7 @@ AT_PC = float(os.environ["STR_AT_PC"]) if "STR_AT_PC" in os.environ else float(c
 # a LESS likely place for a peak, which is the opposite of what the old fractional artefact rows
 # assumed. Height comes from the same population.
 NOISE_P_INT = float(os.environ.get("STR_NOISE_P", cal("noise_p_int", 0.077)))
+NOISE_OFF = os.environ.get("STR_NOISE_OFF", "0") == "1"   # ablation dg1
 NOISE_P_FRAC = float(cal("noise_p_frac", 0.075))
 # SHOULDER. A peak within one repeat of an allele peak is thinned by the analysis, integer and fractional
 # bins alike, noise and artefacts alike; bp distance does not enter and survivors are no taller than far
@@ -440,6 +441,8 @@ NOISE_GAIN = float(os.environ.get("STR_NOISE_GAIN", "0.070"))
 # lost 0.54 stutter peaks.)
 from calibrate import pull_neighbours, pull_prob, PULL_H_GRID
 PULL_P = np.asarray(cal("pull_p", []), float)
+if os.environ.get("STR_PULL_FILTER", "1") == "0":       # ablation dg3
+    PULL_P = np.asarray([], float)
 PULL_BAR = np.asarray(cal("pull_bar", []), float)
 _LOCUS_NAMES = [k for k, _ in sorted(LOCUS_TO_IDX.items(), key=lambda kv: kv[1])]
 _PULL_NB = {}
@@ -2140,6 +2143,8 @@ def gen_mixture(donor_cols, pool, rng, t_total=None, bin_size=None, phi=None,
         for _c in donor_cols:
             _ownb |= (DONOR_DOSAGE[_c] > 0)
         _pb = np.where(_ownb, 0.0, _pb)
+    if NOISE_OFF:                                       # ablation dg1
+        _pb = np.zeros_like(_pb)
     jn = np.where(rng.random(N_FLAT) < _pb)[0]
     if len(jn):
         # One offset for the whole profile - the baseline is an instrument state per injection,

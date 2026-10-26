@@ -4,7 +4,7 @@ set_transformer.py — CLEAN, STANDALONE model for the `inc22_fixed_aslot` arm O
 This is a faithful, verbatim EXTRACTION of the single code path that
 `models/set_transformer.py` takes for the inc22_fixed_aslot configuration:
 
-    cls_decoder = aslot        (CoSA + GSANet + MESH + AdaSlot)
+    cls_decoder = aslot        (free slots + GSANet + MESH + AdaSlot)
     encoder     = isab++       with nc_attn = mab0  (SigmoidMABpp in mab0, MABpp in mab1)
     num_embed   = periodic     (Gorishniy 2022 PLR), periodic_sigma = 0.3
     n_token_feats = 8
@@ -184,9 +184,9 @@ def sinkhorn_log(affinity: torch.Tensor, pad_mask: torch.Tensor,
     return torch.exp(la)
 
 
-# ── Adaptive Slot decoder (CoSA + GSANet + MESH + AdaSlot) ──────────────────
+# ── Adaptive Slot decoder (free slots + GSANet + MESH + AdaSlot) ────────────
 class AdaptiveSlotDecoder(nn.Module):
-    """Slots = panel donors (K=45).  CoSA geno init -> GSANet attr-guided refine -> MESH Sinkhorn-OT
+    """Slots = panel donors (K=45).  free-slot init -> GSANet attr-guided refine -> MESH Sinkhorn-OT
     slot-attention loop -> AdaSlot Gumbel-Sigmoid existence gate.  logits_cls = cls_head(slots) +
     gate_logit."""
 
@@ -219,13 +219,13 @@ class AdaptiveSlotDecoder(nn.Module):
         self.gate_head = nn.Linear(d_model, 1)                              # AdaSlot slot-existence
         self.cls_head  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))  # content
 
-    def forward(self, H: torch.Tensor, pad_mask: torch.Tensor, geno_slots: torch.Tensor,
+    def forward(self, H: torch.Tensor, pad_mask: torch.Tensor, init_slots: torch.Tensor,
                 attr_logits: torch.Tensor | None = None) -> dict:
         B, _, d = H.shape
-        K = geno_slots.shape[1]
+        K = init_slots.shape[1]
 
-        # 1. CoSA: genotype-conditioned slot init
-        slots = geno_slots.clone()
+        # 1. slot init: one learned vector per panel donor
+        slots = init_slots.clone()
 
         # 2. GSANet: attr-weighted peak aggregate -> refine slot init
         if attr_logits is not None:
@@ -283,7 +283,6 @@ class SetTransformerMixture(nn.Module):
                  donor_geno: torch.Tensor | None = None, donor_geno_mask: torch.Tensor | None = None,
                  owner_lut: torch.Tensor | None = None):
         super().__init__()
-        assert donor_geno is not None, "aslot needs donor_geno for CoSA slot init"
         assert owner_lut is not None, "inc22 (set_of_set/feas_filter) needs owner_lut"
         self.n_loci = n_loci
         self.d_model = d_model
@@ -305,16 +304,14 @@ class SetTransformerMixture(nn.Module):
         self.encoder = nn.ModuleList(
             [ISABpp(d_model, n_heads, m_inducing, dropout) for _ in range(n_isab)])
 
-        # aslot decoder + CoSA genotype buffers/projection (registered exactly as in the original)
+        # aslot decoder
         self.cls_decoder_module = AdaptiveSlotDecoder(
             d_model,
             n_iters=n_slot_iters, ot_eps=ot_eps, ot_iters=ot_iters,
             gumbel_temp=gumbel_temp, dropout=dropout,
         )
-        self.register_buffer("donor_geno", donor_geno.float())
-        self.register_buffer("donor_geno_mask", donor_geno_mask.bool())
-        self.geno_proj = nn.Linear(d_model, d_model)
-        nn.init.zeros_(self.geno_proj.weight); nn.init.zeros_(self.geno_proj.bias)
+        # slot init: one learned vector per panel donor (donor_geno / donor_geno_mask are accepted but unused)
+        self.free_slots = nn.Parameter(torch.randn(n_classes, d_model) * 0.02)
 
 
         # privileged aux head (in-silico only): per-peak attribution
@@ -338,19 +335,6 @@ class SetTransformerMixture(nn.Module):
             x = x * feas.unsqueeze(-1).to(x.dtype)
             pad_mask = pad_mask | ~feas
         return x, pad_mask
-
-    def _encode_geno(self) -> torch.Tensor:
-        """CoSA: encode each donor's reference-allele set into a query anchor (C, d), through the SAME
-        locus_embed + input_proj as peaks.  Non-allele continuous features neutralised to 0."""
-        g = self.donor_geno
-        locus_idx = g[:, :, 0].long().clamp(0, self.n_loci - 1)
-        cont = (g[:, :, 1:self.n_token_feats] - self.feat_mean) / self.feat_std
-        cont = cont.clone(); cont[:, :, 1:] = 0.0
-        num = self.num_embed(cont)
-        x = self.input_proj(torch.cat([self.locus_embed(locus_idx), num], dim=-1))
-        m = self.donor_geno_mask.unsqueeze(-1).float()
-        emb = (x * m).sum(1) / m.sum(1).clamp_min(1.0)
-        return self.geno_proj(emb)                                    # zero-init -> 0 at start
 
     def _encode_set(self, tokens, mask):
         """Returns (H, pad_mask).  set_of_set: split peaks into private (n_car==1) / shared
@@ -381,11 +365,10 @@ class SetTransformerMixture(nn.Module):
         H, pad_mask = self._encode_set(tokens, mask)
         B = tokens.size(0)
 
-        geno_e = self._encode_geno()                                  # (K, d)
-        geno_slots = geno_e.unsqueeze(0).expand(B, -1, -1)            # (B, K, d)
+        init_slots = self.free_slots.unsqueeze(0).expand(B, -1, -1)   # (B, K, d)
 
         attr_raw = self.attr_head(H)                                  # (B, N, K+1) incl background (GSANet)
-        slot_out = self.cls_decoder_module(H, pad_mask, geno_slots, attr_logits=attr_raw)
+        slot_out = self.cls_decoder_module(H, pad_mask, init_slots, attr_logits=attr_raw)
 
         out = {
             "logits_cls":   slot_out["logits_cls"],

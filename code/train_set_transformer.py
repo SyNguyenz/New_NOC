@@ -1,7 +1,7 @@
 """
 train_set_transformer.py — trainer + test-time decode for the set-transformer contributor model.
 
-  * model  = SetTransformerMixture (CoSA+GSANet+MESH+AdaSlot, isab++/nc_mab0, periodic embed, aux heads,
+  * model  = SetTransformerMixture (free slots+GSANet+MESH+AdaSlot, isab++/nc_mab0, periodic embed, aux heads,
              set_of_set, feas_filter). See models/set_transformer.py.
   * loss   = ASL(gamma_neg=4) on logits_cls
              + 0.05 * SmoothL1(sum gate, NOC)                   (the live AdaSlot slots ARE the count)

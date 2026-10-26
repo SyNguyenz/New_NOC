@@ -351,6 +351,10 @@ def step(rel, env_extra=None, args=()):
     subprocess.run([PY, str(HERE / rel), *args], cwd=str(HERE), env=env, check=True)
 
 
+# ablation dg1-dg3: STR_GEN_ENV="K=V,..." applies only to the final make_insilico step
+GEN_ENV = dict(kv.split("=", 1) for kv in os.environ.get("STR_GEN_ENV", "").split(",") if "=" in kv)
+
+
 def main():
     assert (HERE / "data_raw").exists(), f"data_raw junction missing at {HERE/'data_raw'}"
     # EVERYTHING BELOW BELONGS TO THIS FOLD. data/ and data_insilico_w/ are emptied first, so no step can read what an
@@ -369,28 +373,30 @@ def main():
     step("synth/extract_genotypes.py")                                # tokens      -> donor_genotypes.csv
     step("build_real_attr.py")                                        # geno+tokens -> attr
     step("features/enrich.py", args=(str(DATA_DIR),))                 # tokens      -> tokens8/9/11
-    step("calibrate_scatter.py",                                      # NOC1 + twin -> art_scatter.json (width of the
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # stutter ratio draw, per offset, from its tail)
-    step("calibrate_pullup.py",                                       # NOC1 + twin -> pullup_emit.json (the pull-up
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # the analysis could not call; an increment too)
-    step("calibrate_allele_stut.py",                                  # NOC1 + twin -> allele_stut.json (per-allele
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # n-1 rate: an increment over the generator,
-                                                                      # so it is re-measured against the one in use)
-    step("calibrate_shoulder.py",                                     # NOC1 + twin -> shoulder_bp.json (a peak 1/2/3
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # bp from an allele: survival and floor by distance)
-    step("calibrate_donor_stut.py",                                   # NOC1 + twin -> donor_stut.json (n-1 emission per
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # donor x allele: same-length alleles that do not stutter)
-    step("calibrate_stut_spread.py",                                  # NOC1 + twin -> stut_spread.json (n-1 scatter
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # width by parent height: less scatter, more copies)
-    step("calibrate_stut_parent.py",                                  # NOC1 + twin -> stut_parent.json (stutter vs
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # parent height, floor separated; after allele_stut)
-    step("calibrate_crowd.py",                                        # TRAIN NOC1 + twin -> noise_cr_inc.json (noise
-         env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # floor vs crowding, over all the laws above)
+    # ablation dg4: STR_SKIP_CAL=1 skips the calibration steps
+    if os.environ.get("STR_SKIP_CAL", "0") != "1":
+        step("calibrate_scatter.py",                                      # NOC1 + twin -> art_scatter.json (width of the
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # stutter ratio draw, per offset, from its tail)
+        step("calibrate_pullup.py",                                       # NOC1 + twin -> pullup_emit.json (the pull-up
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # the analysis could not call; an increment too)
+        step("calibrate_allele_stut.py",                                  # NOC1 + twin -> allele_stut.json (per-allele
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # n-1 rate: an increment over the generator,
+                                                                          # so it is re-measured against the one in use)
+        step("calibrate_shoulder.py",                                     # NOC1 + twin -> shoulder_bp.json (a peak 1/2/3
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # bp from an allele: survival and floor by distance)
+        step("calibrate_donor_stut.py",                                   # NOC1 + twin -> donor_stut.json (n-1 emission per
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # donor x allele: same-length alleles that do not stutter)
+        step("calibrate_stut_spread.py",                                  # NOC1 + twin -> stut_spread.json (n-1 scatter
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # width by parent height: less scatter, more copies)
+        step("calibrate_stut_parent.py",                                  # NOC1 + twin -> stut_parent.json (stutter vs
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # parent height, floor separated; after allele_stut)
+        step("calibrate_crowd.py",                                        # TRAIN NOC1 + twin -> noise_cr_inc.json (noise
+             env_extra={"STR_DATA_DIR": str(DATA_DIR)})                   # floor vs crowding, over all the laws above)
     step("make_insilico.py",                                         # data/       -> data_insilico_w (no drop-in)
-         env_extra={"STR_DATA_DIR": str(DATA_DIR), "STR_OUT_DIR": str(HERE / "data_insilico_w")},
+         env_extra={"STR_DATA_DIR": str(DATA_DIR), "STR_OUT_DIR": str(HERE / "data_insilico_w"), **GEN_ENV},
          # every in-silico mixture draws its treatment, tube Q, template and injection from ranges measured on
          # TRAIN NOC1 (gen_conditioned), which is what puts the calibrated presence/height laws into training.
-         args=("--build", "50000", "--noc_weights", "1,1.5,2.5,2", "--seed", "42"))
+         args=("--build", os.environ.get("STR_GEN_N", "50000"), "--noc_weights", "1,1.5,2.5,2", "--seed", "42"))
     print("\nDONE — full inc22 dataset built in inc22_clean/ (data/ + data_insilico_w/).")
 
 
